@@ -20,6 +20,8 @@ const tmdbSessionId = ref<string | null>(null);
 const tmdbAccount = ref<any | null>(null);
 const isAuthenticating = ref(false);
 const pendingRequestToken = ref<string | null>(null);
+// Page state for bottom nav
+const currentPage = ref('home');
 interface MediaCache {
   media_id: number;
   title: string;
@@ -162,8 +164,8 @@ onMounted(async () => {
 });
 </script>
 <template>
-  <div class="min-h-screen bg-gray-900 text-white p-6">
-    <div class="flex items-center justify-between mb-8">
+  <div class="min-h-screen bg-white text-black p-6 pb-24">
+    <!-- <div class="flex items-center justify-between mb-8">
       <h1 class="text-3xl font-bold">Media Tracker</h1>
       <div class="flex items-center gap-4">
         <template v-if="tmdbSessionId && tmdbAccount">
@@ -201,7 +203,7 @@ onMounted(async () => {
           </template>
         </template>
       </div>
-    </div>
+    </div> -->
     <div class="mb-10">
       <div class="flex gap-4">
         <input
@@ -301,6 +303,55 @@ onMounted(async () => {
         </div>
       </div>
       <p v-else class="text-gray-400">No upcoming items in your watchlist yet.</p>
+    </div>
+    <!-- Fixed Bottom Navigation -->
+    <div class="fixed bottom-0 left-0 right-0 bg-white border-t border-white flex justify-around items-center py-3 z-50">
+      <button
+        @click="currentPage = 'series'"
+        :class="currentPage === 'series' ? 'text-blue-400' : 'text-gray-400'"q
+        class="flex flex-col items-center gap-1 hover:text-white transition-colors"
+      >
+        <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <rect x="3" y="4" width="18" height="18" rx="2" ry="2" stroke-width="2"/>
+          <line x1="16" y1="2" x2="16" y2="6" stroke-width="2"/>
+          <line x1="8" y1="2" x2="8" y2="6" stroke-width="2"/>
+          <line x1="3" y1="10" x2="21" y2="10" stroke-width="2"/>
+        </svg>
+المسلسلات      </button>
+      <button
+        @click="currentPage = 'movies'"
+        :class="currentPage === 'movies' ? 'text-blue-400' : 'text-gray-400'"
+        class="flex flex-col items-center gap-1 hover:text-white transition-colors"
+      >
+        <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18" stroke-width="2"/>
+          <line x1="7" y1="2" x2="7" y2="22" stroke-width="2"/>
+          <polygon points="17,2 17,9 12,7 7,9 7,2" fill="currentColor" stroke-width="0"/>
+        </svg>
+        <span class="text-xs font-medium">أفلام</span>
+      </button>
+      <button
+        @click="currentPage = 'discover'"
+        :class="currentPage === 'discover' ? 'text-blue-400' : 'text-gray-400'"
+        class="flex flex-col items-center gap-1 hover:text-white transition-colors"
+      >
+        <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <circle cx="11" cy="11" r="8" stroke-width="2"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65" stroke-width="2"/>
+        </svg>
+        <span class="text-xs font-medium">استكشف</span>
+      </button>
+      <button
+        @click="currentPage = 'profile'"
+        :class="currentPage === 'profile' ? 'text-blue-400' : 'text-gray-400'"
+        class="flex flex-col items-center gap-1 hover:text-white transition-colors"
+      >
+        <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" stroke-width="2"/>
+          <circle cx="12" cy="7" r="4" stroke-width="2"/>
+        </svg>
+        <span class="text-xs font-medium">الملف الشخصي</span>
+      </button>
     </div>
   </div>
 </template>
