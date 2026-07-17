@@ -22,6 +22,14 @@ struct UserWatchlistItem {
     status: String,
     last_watched_date: Option<String>,
     notes: Option<String>,
+    watched_episode_count: Option<i64>,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct WatchedEpisode {
+    media_id: i64,
+    season_number: i64,
+    episode_number: i64,
+    watched_at: String,
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct WatchlistDashboard {
@@ -42,7 +50,9 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             poster_path TEXT,
             media_type TEXT NOT NULL,
             release_date TEXT,
-            synopsis_cached_json_data TEXT NOT NULL
+            synopsis_cached_json_data TEXT NOT NULL,
+            last_updated TEXT,
+            number_of_seasons INTEGER
         )",
         [],
     )?;
@@ -64,15 +74,62 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS watched_episodes (
+            media_id INTEGER NOT NULL,
+            season_number INTEGER NOT NULL,
+            episode_number INTEGER NOT NULL,
+            watched_at TEXT NOT NULL,
+            PRIMARY KEY (media_id, season_number, episode_number),
+            FOREIGN KEY (media_id) REFERENCES media_cache(media_id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS seasons (
+            media_id INTEGER NOT NULL,
+            season_number INTEGER NOT NULL,
+            season_name TEXT,
+            episode_count INTEGER,
+            air_date TEXT,
+            overview TEXT,
+            poster_path TEXT,
+            PRIMARY KEY (media_id, season_number),
+            FOREIGN KEY (media_id) REFERENCES media_cache(media_id)
+        )",
+        [],
+    )?;
+    // Add last_updated and number_of_seasons columns if they don't exist (for existing databases)
+    conn.execute(
+        "ALTER TABLE media_cache ADD COLUMN last_updated TEXT",
+        [],
+    ).ok();
+    conn.execute(
+        "ALTER TABLE media_cache ADD COLUMN number_of_seasons INTEGER",
+        [],
+    ).ok();
     Ok(())
 }
 // Helper to get app data dir (use OS-standard app data directory)
 fn get_app_data_dir() -> std::path::PathBuf {
-    // Use OS's standard app data directory (e.g., %APPDATA% on Windows, ~/.config on Linux, ~/Library/Application Support on macOS)
-    let data_dir = dirs::data_dir()
-        .expect("Failed to get app data directory")
-        .join("tv-time-clone");
-    std::fs::create_dir_all(&data_dir).expect("Failed to create app data directory");
+    // Get the current executable path to make the app portable
+    let mut exe_path = std::env::current_exe().expect("Failed to get executable path");
+    exe_path.pop(); // Remove the executable name to get its directory
+
+    // In development mode (npm run tauri dev), the exe is in src-tauri/target/debug.
+    // If we detect we are in 'debug', we will place the database in the main project root.
+    if exe_path.ends_with("debug") {
+        // Pop target/debug
+        exe_path.pop();
+        exe_path.pop();
+        // Pop src-tauri
+        if exe_path.ends_with("src-tauri") {
+            exe_path.pop();
+        }
+    }
+
+    let data_dir = exe_path.join("database");
+    std::fs::create_dir_all(&data_dir).expect("Failed to create database directory");
     data_dir
 }
 // Tauri command: Search TMDB API
@@ -87,6 +144,147 @@ async fn search_tmdb_api(query: String) -> Result<serde_json::Value, String> {
     let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
     let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
     Ok(json)
+}
+// Tauri command: Get TMDB videos (trailers)
+#[tauri::command]
+async fn get_tmdb_videos(media_id: i64, media_type: String) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let endpoint = match media_type.as_str() {
+        "movie" => "movie",
+        "tv" => "tv",
+        _ => return Err("Invalid media type".to_string()),
+    };
+    let url = format!(
+        "{}/{}/{}/videos?api_key={}",
+        TMDB_BASE_URL, endpoint, media_id, TMDB_API_KEY
+    );
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    Ok(json)
+}
+
+// Tauri command: Get similar movies/shows
+#[tauri::command]
+async fn get_tmdb_similar(media_id: i64, media_type: String) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let endpoint = match media_type.as_str() {
+        "movie" => "movie",
+        "tv" => "tv",
+        _ => return Err("Invalid media type".to_string()),
+    };
+    let url = format!(
+        "{}/{}/{}/similar?api_key={}",
+        TMDB_BASE_URL, endpoint, media_id, TMDB_API_KEY
+    );
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    Ok(json)
+}
+
+// Tauri command: Get recommended movies/shows
+#[tauri::command]
+async fn get_tmdb_recommendations(
+    media_id: i64,
+    media_type: String,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let endpoint = match media_type.as_str() {
+        "movie" => "movie",
+        "tv" => "tv",
+        _ => return Err("Invalid media type".to_string()),
+    };
+    let url = format!(
+        "{}/{}/{}/recommendations?api_key={}",
+        TMDB_BASE_URL, endpoint, media_id, TMDB_API_KEY
+    );
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    Ok(json)
+}
+
+// Tauri command: Get TV seasons and episodes from TMDB
+#[tauri::command]
+async fn get_tv_seasons(media_id: i64) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/tv/{}?api_key={}",
+        TMDB_BASE_URL, media_id, TMDB_API_KEY
+    );
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    Ok(json)
+}
+
+// Tauri command: Get episodes for a specific TV season
+#[tauri::command]
+async fn get_tv_season_episodes(media_id: i64, season_number: i64) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/tv/{}/season/{}?api_key={}",
+        TMDB_BASE_URL, media_id, season_number, TMDB_API_KEY
+    );
+    let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    Ok(json)
+}
+
+// Tauri command: Get watched episodes for a TV show
+#[tauri::command]
+async fn get_watched_episodes(
+    media_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<WatchedEpisode>, String> {
+    let conn = state.db.lock().await;
+    let mut stmt = conn.prepare("SELECT media_id, season_number, episode_number, watched_at FROM watched_episodes WHERE media_id = ?1")
+        .map_err(|e| e.to_string())?;
+    let episodes = stmt
+        .query_map(params![media_id], |row| {
+            Ok(WatchedEpisode {
+                media_id: row.get(0)?,
+                season_number: row.get(1)?,
+                episode_number: row.get(2)?,
+                watched_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut result = Vec::new();
+    for episode in episodes {
+        result.push(episode.map_err(|e| e.to_string())?);
+    }
+    Ok(result)
+}
+
+// Tauri command: Toggle episode watched status
+#[tauri::command]
+async fn toggle_episode_watched(
+    media_id: i64,
+    season_number: i64,
+    episode_number: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    // Check if episode is already watched
+    let exists = conn.query_row(
+        "SELECT 1 FROM watched_episodes WHERE media_id = ?1 AND season_number = ?2 AND episode_number = ?3",
+        params![media_id, season_number, episode_number],
+        |_| Ok(()),
+    ).optional().map_err(|e| e.to_string())?;
+
+    if exists.is_some() {
+        // Delete it
+        conn.execute(
+            "DELETE FROM watched_episodes WHERE media_id = ?1 AND season_number = ?2 AND episode_number = ?3",
+            params![media_id, season_number, episode_number],
+        ).map_err(|e| e.to_string())?;
+    } else {
+        // Add it
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO watched_episodes (media_id, season_number, episode_number, watched_at) VALUES (?1, ?2, ?3, ?4)",
+            params![media_id, season_number, episode_number, now],
+        ).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 // Helper function to fetch media details from TMDB
 async fn fetch_media_details_from_tmdb(
@@ -175,7 +373,7 @@ async fn add_media_to_watchlist(
         serde_json::Value::Null // Not needed, already cached
     };
     // Now get lock and update DB
-    let mut conn = state.db.lock().await;
+    let conn = state.db.lock().await;
     if cached.is_none() {
         // Cache the newly fetched media
         let title = match media_type.as_str() {
@@ -224,6 +422,28 @@ async fn mark_as_watched(media_id: i64, state: State<'_, AppState>) -> Result<()
     .map_err(|e| e.to_string())?;
     Ok(())
 }
+// Tauri command: Mark as to watch
+#[tauri::command]
+async fn mark_as_to_watch(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    conn.execute(
+        "UPDATE user_watchlist SET status = ?1, last_watched_date = ?2 WHERE media_id = ?3",
+        params!["to_watch", None::<String>, media_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+// Tauri command: Remove from watchlist
+#[tauri::command]
+async fn remove_from_watchlist(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    conn.execute(
+        "DELETE FROM user_watchlist WHERE media_id = ?1",
+        params![media_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
 // Tauri command: Get watchlist dashboard
 #[tauri::command]
 async fn get_watchlist_dashboard(state: State<'_, AppState>) -> Result<WatchlistDashboard, String> {
@@ -231,7 +451,8 @@ async fn get_watchlist_dashboard(state: State<'_, AppState>) -> Result<Watchlist
     let mut stmt = conn
     .prepare(
       "SELECT mc.media_id, mc.title, mc.poster_path, mc.media_type, mc.release_date, mc.synopsis_cached_json_data,
-              uw.status, uw.last_watched_date, uw.notes
+              uw.status, uw.last_watched_date, uw.notes,
+              (SELECT COUNT(*) FROM watched_episodes we WHERE we.media_id = mc.media_id) as watched_episode_count
        FROM media_cache mc
        JOIN user_watchlist uw ON mc.media_id = uw.media_id",
     )
@@ -251,6 +472,7 @@ async fn get_watchlist_dashboard(state: State<'_, AppState>) -> Result<Watchlist
                 status: row.get(6)?,
                 last_watched_date: row.get(7)?,
                 notes: row.get(8)?,
+                watched_episode_count: row.get(9).unwrap_or(Some(0)),
             };
             Ok((media, watchlist))
         })
@@ -390,6 +612,157 @@ async fn get_tmdb_account(session_id: &str) -> Result<TmdbAccountResponse, Strin
     let account: TmdbAccountResponse = response.json().await.map_err(|e| e.to_string())?;
     Ok(account)
 }
+
+// Background task to check for new seasons
+async fn check_for_new_seasons(db: Arc<Mutex<Connection>>) {
+    // Check if we've done a check in the last 24 hours
+    let should_check = {
+        let conn = db.lock().await;
+        let last_check: Option<String> = conn
+            .query_row("SELECT last_updated FROM media_cache WHERE media_type = 'tv' LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| {
+                eprintln!("Error checking last update time: {}", e);
+                e
+            })
+            .unwrap();
+        
+        if let Some(last_check_str) = last_check {
+            if let Ok(last_check) = chrono::DateTime::parse_from_rfc3339(&last_check_str) {
+                let now = chrono::Utc::now();
+                let duration = now.signed_duration_since(last_check.with_timezone(&chrono::Utc));
+                duration.num_hours() >= 24
+            } else {
+                true // Invalid date format, check anyway
+            }
+        } else {
+            true // No previous check, check now
+        }
+    };
+    
+    if !should_check {
+        println!("Skipping season check - last check was less than 24 hours ago.");
+        return;
+    }
+    
+    println!("Checking for new seasons...");
+    let tv_shows = {
+        let conn = db.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT media_id, title, number_of_seasons FROM media_cache WHERE media_type = 'tv'")
+            .map_err(|e| {
+                eprintln!("Error preparing statement: {}", e);
+                e
+            })
+            .unwrap();
+        
+        let shows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(|e| {
+                eprintln!("Error querying shows: {}", e);
+                e
+            })
+            .unwrap();
+        
+        let mut result = Vec::new();
+        for show in shows {
+            if let Ok(show) = show {
+                result.push(show);
+            }
+        }
+        result
+    };
+
+    for (media_id, title, current_seasons) in tv_shows {
+        println!("Checking show: {} (ID: {})", title, media_id);
+        
+        // Fetch latest data from TMDB
+        let client = reqwest::Client::new();
+        let url = format!("{}/tv/{}?api_key={}", TMDB_BASE_URL, media_id, TMDB_API_KEY);
+        
+        match client.get(&url).send().await {
+            Ok(response) => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(new_seasons) = json.get("number_of_seasons").and_then(|s| s.as_i64()) {
+                            let has_new_season = match current_seasons {
+                                Some(current) => new_seasons > current,
+                                None => true,
+                            };
+                            
+                            if has_new_season {
+                                println!("NEW SEASON DETECTED for {}: {} seasons (was {:?})", title, new_seasons, current_seasons);
+                                
+                                // Update media_cache
+                                let now = chrono::Utc::now().to_rfc3339();
+                                {
+                                    let conn = db.lock().await;
+                                    conn.execute(
+                                        "UPDATE media_cache SET number_of_seasons = ?1, last_updated = ?2 WHERE media_id = ?3",
+                                        params![new_seasons, now, media_id],
+                                    ).ok();
+                                }
+                                
+                                // Fetch and cache seasons data
+                                if let Some(seasons_array) = json.get("seasons").and_then(|s| s.as_array()) {
+                                    let conn = db.lock().await;
+                                    for season in seasons_array {
+                                        if let Some(season_number) = season.get("season_number").and_then(|s| s.as_i64()) {
+                                            if season_number > 0 { // Skip special seasons (season 0)
+                                                let season_name = season.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                                let episode_count = season.get("episode_count").and_then(|e| e.as_i64()).unwrap_or(0);
+                                                let air_date = season.get("air_date").and_then(|d| d.as_str()).map(|s| s.to_string());
+                                                let overview = season.get("overview").and_then(|o| o.as_str()).map(|s| s.to_string());
+                                                let poster_path = season.get("poster_path").and_then(|p| p.as_str()).map(|s| s.to_string());
+                                                
+                                                conn.execute(
+                                                    "INSERT OR REPLACE INTO seasons (media_id, season_number, season_name, episode_count, air_date, overview, poster_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                                    params![media_id, season_number, season_name, episode_count, air_date, overview, poster_path],
+                                                ).ok();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error parsing JSON for show {}: {}", title, e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error fetching data for show {}: {}", title, e);
+            }
+        }
+        
+        // Rate limiting: sleep for 250ms between requests to avoid TMDB rate limits
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    }
+    
+    println!("Season check completed.");
+}
+
+// Start background task for season updates
+async fn start_season_update_task(db: Arc<Mutex<Connection>>) {
+    // Run immediately on startup
+    check_for_new_seasons(db.clone()).await;
+    
+    // Then run every 24 hours
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(24 * 60 * 60));
+    loop {
+        interval.tick().await;
+        check_for_new_seasons(db.clone()).await;
+    }
+}
 // Get saved TMDB session (if any)
 #[tauri::command]
 async fn get_saved_tmdb_session(state: State<'_, AppState>) -> Result<Option<String>, String> {
@@ -515,17 +888,37 @@ pub fn run() {
     let db_path = app_data_dir.join("tv-time-clone.db");
     let conn = Connection::open(db_path).expect("failed to open database");
     init_db(&conn).expect("failed to initialize database");
+    
+    let db_arc = Arc::new(Mutex::new(conn));
+    let db_arc_for_task = db_arc.clone();
+    
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init()) // Add shell plugin!
         .manage(AppState {
-            db: Arc::new(Mutex::new(conn)),
+            db: db_arc,
+        })
+        .setup(move |_app| {
+            // Spawn background task for season updates after app is setup
+            tauri::async_runtime::spawn(async move {
+                start_season_update_task(db_arc_for_task).await;
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             search_tmdb_api,
+            get_tmdb_videos,
+            get_tmdb_similar,
+            get_tmdb_recommendations,
             get_upcoming_movies,
             add_media_to_watchlist,
+            remove_from_watchlist,
             mark_as_watched,
+            mark_as_to_watch,
             get_watchlist_dashboard,
+            get_tv_seasons,
+            get_tv_season_episodes,
+            get_watched_episodes,
+            toggle_episode_watched,
             // New TMDB account commands
             get_tmdb_request_token,
             open_tmdb_auth_url,
