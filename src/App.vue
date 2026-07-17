@@ -41,6 +41,7 @@ interface UserWatchlistItem {
   status: string;
   last_watched_date: string | null;
   notes: string | null;
+  watched_episode_count?: number;
 }
 interface WatchlistDashboard {
   released_watchlist: [MediaCache, UserWatchlistItem][];
@@ -63,6 +64,8 @@ const activeShowsTab = ref<'watchlist' | 'upcoming'>('watchlist');
 const trailerVideo = ref<any>(null);
 const expandedSeason = ref<number | null>(null);
 const seasonEpisodes = ref<any[]>([]);
+const upcomingEpisodes = ref<any[]>([]);
+const nextEpisodesToWatch = ref<any[]>([]);
 const watchlistMediaIds = computed(() => {
   const ids = new Set<number>();
   releasedWatchlist.value.forEach(([media]) => ids.add(media.media_id));
@@ -81,6 +84,44 @@ const showsHaventStarted = computed(() => {
 const showsUpcoming = computed(() => {
   return upcomingWatchlist.value.filter(m => m[0].media_type === 'tv');
 });
+const profileWatchedMovies = computed(() => watchedReleased.value);
+const profileCompletedShows = computed(() => {
+  const nextIds = new Set(nextEpisodesToWatch.value.map((ep: any) => ep.media_id));
+  return releasedWatchlist.value.filter(([media, wl]) => {
+    if (media.media_type !== 'tv') return false;
+    const watchedCount = wl.watched_episode_count ?? 0;
+    if (watchedCount <= 0) return false;
+    // No next episode left = finished the show
+    if (!nextIds.has(media.media_id)) return true;
+    try {
+      const data = JSON.parse(media.synopsis_cached_json_data || '{}');
+      const total = data.number_of_episodes;
+      if (typeof total === 'number' && total > 0) {
+        return watchedCount >= total;
+      }
+    } catch {
+      // ignore parse errors
+    }
+    return false;
+  });
+});
+const profileEpisodesWatched = computed(() =>
+  releasedWatchlist.value.reduce((sum, [, wl]) => sum + (wl.watched_episode_count ?? 0), 0)
+);
+interface UserProfileData {
+  name: string;
+  avatar_data_url: string | null;
+  cover_data_url: string | null;
+}
+const userProfile = ref<UserProfileData>({
+  name: '',
+  avatar_data_url: null,
+  cover_data_url: null,
+});
+const isEditingProfileName = ref(false);
+const profileNameDraft = ref('');
+const avatarFileInput = ref<HTMLInputElement | null>(null);
+const coverFileInput = ref<HTMLInputElement | null>(null);
 const isWatched = (mediaId: number) => {
   const entry = [...releasedWatchlist.value, ...upcomingWatchlist.value].find(([m]) => m.media_id === mediaId);
   return entry ? entry[1].status === 'watched' : false;
@@ -190,6 +231,12 @@ const openMediaDetails = async (item: any, mediaType?: string) => {
       console.error('Failed to parse cached media data:', e);
     }
   }
+  
+  // Ensure poster_path is preserved from the original item if not in fullMediaData
+  if (item.poster_path && !fullMediaData.poster_path) {
+    fullMediaData.poster_path = item.poster_path;
+  }
+  
   const newMedia = {
     ...fullMediaData,
     id: item.id || item.media_id, // Normalize ID
@@ -223,6 +270,18 @@ const fetchTVSeasons = async (mediaId: number) => {
     
     // Get seasons
     const data = await invoke('get_tv_seasons', { mediaId });
+    
+    if (data) {
+      // Update selectedMedia with full TMDB data to get backdrop, poster, overview, etc.
+      if (selectedMedia.value && selectedMedia.value.id === mediaId) {
+        selectedMedia.value = {
+          ...selectedMedia.value,
+          ...data,
+          media_type: 'tv'
+        };
+      }
+    }
+
     if (data.seasons) {
       const seasons = data.seasons;
       seasons.sort((a: any, b: any) => {
@@ -256,6 +315,7 @@ const toggleEpisode = async (mediaId: number, seasonNumber: number, episodeNumbe
     }
     // Reload dashboard to update counts
     await loadDashboard();
+    await loadNextEpisodesToWatch();
   } catch (e) {
     console.error('Error toggling episode:', e);
   }
@@ -291,6 +351,7 @@ const markSeasonAsWatched = async (mediaId: number, seasonNumber: number) => {
         }
       }
       await loadDashboard();
+      await loadNextEpisodesToWatch();
     }
   } catch (e) {
     console.error('Error marking season as watched:', e);
@@ -309,6 +370,7 @@ const unmarkSeasonAsWatched = async (mediaId: number, seasonNumber: number) => {
         }
       }
       await loadDashboard();
+      await loadNextEpisodesToWatch();
     }
   } catch (e) {
     console.error('Error unmarking season as watched:', e);
@@ -411,6 +473,24 @@ const loadDashboard = async () => {
     console.error('Load dashboard error:', error);
   }
 };
+
+const loadUpcomingEpisodes = async () => {
+  try {
+    const result = await invoke('get_upcoming_episodes');
+    upcomingEpisodes.value = result.upcoming_episodes || [];
+  } catch (error) {
+    console.error('Load upcoming episodes error:', error);
+  }
+};
+
+const loadNextEpisodesToWatch = async () => {
+  try {
+    const result = await invoke('get_next_episodes_to_watch');
+    nextEpisodesToWatch.value = result.next_episodes || [];
+  } catch (error) {
+    console.error('Load next episodes to watch error:', error);
+  }
+};
 const getDaysUntilRelease = (releaseDate: string | null) => {
   if (!releaseDate) return null;
   const release = new Date(releaseDate);
@@ -485,9 +565,83 @@ async function toggleTmdbWatchlist(mediaId: number, mediaType: string, inWatchli
     console.error('Toggle TMDB watchlist error:', error);
   }
 }
+const loadUserProfile = async () => {
+  try {
+    const profile = await invoke('get_user_profile') as UserProfileData;
+    userProfile.value = {
+      name: profile?.name || '',
+      avatar_data_url: profile?.avatar_data_url || null,
+      cover_data_url: profile?.cover_data_url || null,
+    };
+    profileNameDraft.value = userProfile.value.name;
+  } catch (error) {
+    console.error('Load user profile error:', error);
+  }
+};
+const persistUserProfile = async (next: UserProfileData) => {
+  try {
+    const saved = await invoke('save_user_profile', { profile: next }) as UserProfileData;
+    userProfile.value = {
+      name: saved?.name || '',
+      avatar_data_url: saved?.avatar_data_url || null,
+      cover_data_url: saved?.cover_data_url || null,
+    };
+  } catch (error) {
+    console.error('Save user profile error:', error);
+  }
+};
+const startEditProfileName = () => {
+  profileNameDraft.value = userProfile.value.name;
+  isEditingProfileName.value = true;
+};
+const saveProfileName = async () => {
+  const name = profileNameDraft.value.trim();
+  isEditingProfileName.value = false;
+  await persistUserProfile({ ...userProfile.value, name });
+};
+const cancelEditProfileName = () => {
+  profileNameDraft.value = userProfile.value.name;
+  isEditingProfileName.value = false;
+};
+const readImageAsDataUrl = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+const onAvatarSelected = async (event: Event) => {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  try {
+    const dataUrl = await readImageAsDataUrl(file);
+    await persistUserProfile({ ...userProfile.value, avatar_data_url: dataUrl });
+  } catch (error) {
+    console.error('Avatar upload error:', error);
+  } finally {
+    input.value = '';
+  }
+};
+const onCoverSelected = async (event: Event) => {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  try {
+    const dataUrl = await readImageAsDataUrl(file);
+    await persistUserProfile({ ...userProfile.value, cover_data_url: dataUrl });
+  } catch (error) {
+    console.error('Cover upload error:', error);
+  } finally {
+    input.value = '';
+  }
+};
 onMounted(async () => {
   await checkTmdbSession();
   await loadDashboard();
+  await loadUpcomingEpisodes();
+  await loadNextEpisodesToWatch();
+  await loadUserProfile();
   try {
     await invoke('get_upcoming_movies', { page: 1 });
   } catch (error) {
@@ -641,42 +795,39 @@ onMounted(async () => {
       
       <div v-if="activeShowsTab === 'watchlist'">
         <!-- Watch Next section -->
-        <div class="mb-8">
-          <h2 class="text-center text-sm font-bold bg-gray-400 text-white rounded-full px-4 py-1 inline-block mb-4 mx-auto block w-max">WATCH NEXT</h2>
-          <div v-if="showsWatchNext.length > 0" class="grid grid-cols-6 gap-2">
+        <div class="mb-8 text-center">
+          <h2 class="text-sm font-bold bg-gray-400 text-white rounded-full px-4 py-1 inline-block mb-4 mx-auto block w-max">WATCH LIST</h2>
+          <div v-if="nextEpisodesToWatch.filter(ep => !ep.is_havent_started).length > 0" class="grid grid-cols-6 gap-2">
             <div
-              v-for="[media, watchlist] in showsWatchNext"
-              :key="media.media_id"
+              v-for="ep in nextEpisodesToWatch.filter(ep => !ep.is_havent_started)"
+              :key="`${ep.media_id}-${ep.season_number}-${ep.episode_number}`"
               class="flex flex-col items-center cursor-pointer relative"
-              @click="openMediaDetails(media, 'tv')"
+              @click="openMediaDetails({ id: ep.media_id, media_type: 'tv', title: ep.title, poster_path: ep.poster_path }, 'tv')"
             >
               <img
-                :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
-                :alt="media.title"
+                :src="ep.poster_path ? `https://image.tmdb.org/t/p/w185${ep.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
+                :alt="ep.title"
                 class="w-full aspect-[2/3] object-cover rounded-lg"
               />
-              <div class="w-full mt-2 bg-gray-200 h-1.5 rounded-full overflow-hidden">
-                 <div class="bg-yellow-400 h-full" style="width: 50%"></div>
-              </div>
             </div>
           </div>
           <p v-else class="text-gray-400 text-center mb-8">No shows in progress.</p>
         </div>
         
         <!-- Haven't Started section -->
-        <div>
-          <h2 class="text-center text-sm font-bold bg-gray-400 text-white rounded-full px-4 py-1 inline-block mb-4 mx-auto block w-max">HAVEN'T STARTED</h2>
-          <div v-if="showsHaventStarted.length > 0" class="grid grid-cols-6 gap-2">
+        <div class="text-center">
+          <h2 class="text-sm font-bold bg-gray-400 text-white rounded-full px-4 py-1 inline-block mb-4 mx-auto block w-max">HAVEN'T STARTED</h2>
+          <div v-if="nextEpisodesToWatch.filter(ep => ep.is_havent_started).length > 0" class="grid grid-cols-6 gap-2">
             <div
-              v-for="[media, watchlist] in showsHaventStarted"
-              :key="media.media_id"
-              class="flex flex-col items-center cursor-pointer relative overflow-hidden aspect-[2/3] group"
-              @click="openMediaDetails(media, 'tv')"
+              v-for="ep in nextEpisodesToWatch.filter(ep => ep.is_havent_started)"
+              :key="ep.media_id"
+              class="flex flex-col items-center cursor-pointer relative"
+              @click="openMediaDetails({ id: ep.media_id, media_type: 'tv', title: ep.title, poster_path: ep.poster_path }, 'tv')"
             >
               <img
-                :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
-                :alt="media.title"
-                class="absolute inset-0 w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
+                :src="ep.poster_path ? `https://image.tmdb.org/t/p/w185${ep.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
+                :alt="ep.title"
+                class="w-full aspect-[2/3] object-cover rounded-lg"
               />
             </div>
           </div>
@@ -685,21 +836,30 @@ onMounted(async () => {
       </div>
       
       <div v-else-if="activeShowsTab === 'upcoming'">
-        <div v-if="showsUpcoming.length > 0" class="grid grid-cols-6 gap-2">
+        <div v-if="upcomingEpisodes.length > 0" class="grid grid-cols-6 gap-2">
           <div
-            v-for="[media, _] in showsUpcoming"
-            :key="media.media_id"
+            v-for="ep in upcomingEpisodes"
+            :key="`${ep.media_id}-${ep.season_number}-${ep.episode_number}`"
             class="flex flex-col items-center cursor-pointer relative"
-            @click="openMediaDetails(media, 'tv')"
+            @click="openMediaDetails({ id: ep.media_id, media_type: 'tv', title: ep.title }, 'tv')"
           >
-            <img
-              :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
-              :alt="media.title"
-              class="w-full aspect-[2/3] object-cover rounded-lg"
-            />
+            <div class="relative w-full">
+              <img
+                :src="ep.still_path ? `https://image.tmdb.org/t/p/w185${ep.still_path}` : (ep.poster_path ? `https://image.tmdb.org/t/p/w185${ep.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image')"
+                :alt="ep.episode_name"
+                class="w-full aspect-[2/3] object-cover rounded-lg"
+              />
+              <div class="absolute bottom-2 left-2 bg-black/70 text-white px-2 py-1 rounded-md">
+                <span class="text-lg font-bold">{{ ep.days_until }}</span>
+              <br>
+                <span class="text-lg ">days</span>
+              </div>
+            </div>
+            <p class="text-xs text-gray-600 mt-1 text-center line-clamp-2">{{ ep.title }}</p>
+            <p class="text-xs text-gray-500 text-center">S{{ ep.season_number }} E{{ ep.episode_number }}</p>
           </div>
         </div>
-        <p v-else class="text-gray-400 text-center mb-8">No upcoming shows.</p>
+        <p v-else class="text-gray-400 text-center mb-8">No upcoming episodes.</p>
       </div>
     </div>
     <!-- Discover Page (new) -->
@@ -819,13 +979,16 @@ onMounted(async () => {
           <div class="w-2 h-2 bg-white/50 rounded-full" />
           <div class="w-2 h-2 bg-white/50 rounded-full" />
         </div>
-        <div class="absolute bottom-0 left-0 right-0 p-6">
-          <h1 class="text-3xl font-bold text-white mb-2">
-            {{ selectedMedia.title || selectedMedia.name }}
-          </h1>
-          <p class="text-white/90 text-lg mb-2">
-            {{ selectedMedia.runtime ? `${Math.floor(selectedMedia.runtime / 60)}h ${selectedMedia.runtime % 60}m` : '2h 49m' }} • {{ selectedMedia.genres?.map(g => g.name).join(', ') || 'Action, Adventure, Thriller' }}
-          </p>
+        <div class="absolute bottom-0 left-0 right-0 p-6 flex gap-4 items-end">
+
+          <div class="flex-1">
+            <h1 class="text-3xl font-bold text-white mb-2">
+              {{ selectedMedia.title || selectedMedia.name }}
+            </h1>
+            <p class="text-white/90 text-lg mb-2">
+              {{ selectedMedia.runtime ? `${Math.floor(selectedMedia.runtime / 60)}h ${selectedMedia.runtime % 60}m` : '2h 49m' }} • {{ selectedMedia.genres?.map(g => g.name).join(', ') || 'Action, Adventure, Thriller' }}
+            </p>
+          </div>
         </div>
       </div>
       <div class="px-6 pt-6 space-y-4 bg-[#F6F6F6]">
@@ -1194,6 +1357,283 @@ onMounted(async () => {
         </svg>
         {{ selectedMedia.media_type === 'tv' ? 'REMOVE SHOW' : 'REMOVE MOVIE' }}
       </button>
+    </div>
+    <!-- Profile Page -->
+    <div v-else-if="currentPage === 'profile'" class="-mx-6">
+      <input
+        ref="avatarFileInput"
+        type="file"
+        accept="image/*"
+        class="hidden"
+        @change="onAvatarSelected"
+      />
+      <input
+        ref="coverFileInput"
+        type="file"
+        accept="image/*"
+        class="hidden"
+        @change="onCoverSelected"
+      />
+
+      <!-- Cover + identity -->
+      <div class="relative mb-2">
+        <div
+          class="relative h-44 bg-[#2a2a2a] overflow-hidden"
+          :style="userProfile.cover_data_url
+            ? { backgroundImage: `url(${userProfile.cover_data_url})`, backgroundSize: 'cover', backgroundPosition: 'center' }
+            : undefined"
+        >
+          <div class="absolute inset-0 bg-black/25 pointer-events-none"></div>
+          <div class="relative z-10 flex items-center justify-between px-6 py-4">
+            <button class="w-10 h-10 rounded-full bg-yellow-400 flex items-center justify-center" type="button" aria-label="Notifications">
+              <svg class="w-5 h-5 text-black" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 22c1.1 0 2-.9 2-2h-4a2 2 0 0 0 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4a1.5 1.5 0 0 0-3 0v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/>
+              </svg>
+            </button>
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                class="w-9 h-9 rounded-full bg-black/50 text-white flex items-center justify-center hover:bg-black/70"
+                aria-label="Change cover photo"
+                @click="coverFileInput?.click()"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7h3l2-3h8l2 3h3v12H3V7z"/>
+                  <circle cx="12" cy="13" r="3.5" stroke-width="2"/>
+                </svg>
+              </button>
+              <button class="p-2 text-white" type="button" aria-label="Menu">
+                <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+                  <circle cx="5" cy="12" r="2"/>
+                  <circle cx="12" cy="12" r="2"/>
+                  <circle cx="19" cy="12" r="2"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="px-6 -mt-10 relative z-10">
+          <div class="flex items-end gap-3">
+            <div class="relative">
+              <div class="w-24 h-24 rounded-full bg-gray-300 border-4 border-white overflow-hidden flex items-center justify-center">
+                <img
+                  v-if="userProfile.avatar_data_url"
+                  :src="userProfile.avatar_data_url"
+                  alt="Profile"
+                  class="w-full h-full object-cover"
+                />
+                <svg v-else class="w-14 h-14 text-gray-500" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8V22h19.2v-2.8c0-3.2-6.4-4.8-9.6-4.8z"/>
+                </svg>
+              </div>
+              <button
+                type="button"
+                class="absolute bottom-0 right-0 w-8 h-8 rounded-full bg-yellow-400 text-black flex items-center justify-center border-2 border-white shadow"
+                aria-label="Change profile photo"
+                @click="avatarFileInput?.click()"
+              >
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7h3l2-3h8l2 3h3v12H3V7z"/>
+                  <circle cx="12" cy="13" r="3.5" stroke-width="2"/>
+                </svg>
+              </button>
+            </div>
+
+            <button
+              type="button"
+              class="mb-2 px-4 py-1.5 rounded-full border border-gray-800 bg-[#2a2a2a] text-white text-xs font-bold tracking-wide"
+              @click="startEditProfileName"
+            >
+              EDIT
+            </button>
+          </div>
+
+          <div class="mt-3 mb-4">
+            <div v-if="isEditingProfileName" class="flex items-center gap-2">
+              <input
+                v-model="profileNameDraft"
+                type="text"
+                maxlength="40"
+                placeholder="Your name"
+                class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-lg font-bold focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                @keyup.enter="saveProfileName"
+                @keyup.escape="cancelEditProfileName"
+              />
+              <button type="button" class="px-3 py-2 bg-yellow-400 rounded-lg font-semibold text-sm" @click="saveProfileName">Save</button>
+              <button type="button" class="px-3 py-2 text-gray-500 text-sm" @click="cancelEditProfileName">Cancel</button>
+            </div>
+            <h1 v-else class="text-2xl font-bold">{{ userProfile.name || 'Your name' }}</h1>
+          </div>
+        </div>
+      </div>
+
+      <!-- Social counts (static) -->
+      <div class="grid grid-cols-3 border-y border-gray-200 bg-white mb-6">
+        <div class="py-3 text-center border-r border-gray-200">
+          <p class="font-bold text-lg leading-none">...</p>
+          <p class="text-xs text-gray-500 mt-1">following</p>
+        </div>
+        <div class="py-3 text-center border-r border-gray-200">
+          <p class="font-bold text-lg leading-none">...</p>
+          <p class="text-xs text-gray-500 mt-1">followers</p>
+        </div>
+        <div class="py-3 text-center">
+          <p class="font-bold text-lg leading-none">...</p>
+          <p class="text-xs text-gray-500 mt-1">comments</p>
+        </div>
+      </div>
+
+      <div class="px-6 pb-8 space-y-8">
+        <!-- Stats -->
+        <section>
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-xl font-bold">Stats</h2>
+            <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="border border-gray-200 rounded-lg p-3 bg-white">
+              <div class="flex items-center gap-2 mb-3 text-sm text-gray-600">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <rect x="2" y="7" width="20" height="15" rx="2" stroke-width="2"/>
+                  <path d="M17 7V5a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v2" stroke-width="2"/>
+                </svg>
+                <span>TV time</span>
+              </div>
+              <div class="flex justify-between text-center">
+                <div>
+                  <p class="text-lg font-bold leading-none">0</p>
+                  <p class="text-[10px] text-gray-400 uppercase mt-1">Months</p>
+                </div>
+                <div>
+                  <p class="text-lg font-bold leading-none">1</p>
+                  <p class="text-[10px] text-gray-400 uppercase mt-1">Day</p>
+                </div>
+                <div>
+                  <p class="text-lg font-bold leading-none">17</p>
+                  <p class="text-[10px] text-gray-400 uppercase mt-1">Hours</p>
+                </div>
+              </div>
+            </div>
+            <div class="border border-gray-200 rounded-lg p-3 bg-white">
+              <div class="flex items-center gap-2 mb-3 text-sm text-gray-600">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <rect x="3" y="4" width="18" height="18" rx="2" stroke-width="2"/>
+                  <path d="M16 2v4M8 2v4M3 10h18" stroke-width="2"/>
+                  <path d="M9 14l2 2 4-4" stroke-width="2"/>
+                </svg>
+                <span class="truncate">Episodes watched</span>
+              </div>
+              <p class="text-3xl font-bold">{{ profileEpisodesWatched }}</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Lists (static) -->
+        <section>
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-xl font-bold">Lists</h2>
+            <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          </div>
+          <a
+            href="#"
+            class="block w-full bg-gray-100 hover:bg-gray-200 rounded-lg py-10 text-center no-underline"
+            @click.prevent
+          >
+            <div class="flex flex-col items-center gap-2 text-gray-500">
+              <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <line x1="12" y1="5" x2="12" y2="19" stroke-width="2"/>
+                <line x1="5" y1="12" x2="19" y2="12" stroke-width="2"/>
+              </svg>
+              <span class="text-sm font-semibold tracking-wide">CREATE A NEW LIST</span>
+            </div>
+          </a>
+        </section>
+
+        <!-- Shows (completed) -->
+        <section>
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-xl font-bold">Shows</h2>
+            <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          </div>
+          <div v-if="profileCompletedShows.length > 0" class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+            <div
+              v-for="[media] in profileCompletedShows"
+              :key="media.media_id"
+              class="flex-shrink-0 w-24 cursor-pointer"
+              @click="openMediaDetails(media, 'tv')"
+            >
+              <img
+                :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
+                :alt="media.title"
+                class="w-full aspect-[2/3] object-cover rounded-md bg-gray-200"
+              />
+            </div>
+          </div>
+          <div v-else class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+            <div v-for="n in 4" :key="n" class="flex-shrink-0 w-24 aspect-[2/3] rounded-md bg-gray-200"></div>
+          </div>
+        </section>
+
+        <!-- Favorite shows (empty for now) -->
+        <section>
+          <div class="flex items-center gap-2 mb-3">
+            <svg class="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+            </svg>
+            <h2 class="text-xl font-bold">Favorite shows</h2>
+          </div>
+          <div class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+            <div v-for="n in 4" :key="n" class="flex-shrink-0 w-24 aspect-[2/3] rounded-md bg-gray-200"></div>
+          </div>
+        </section>
+
+        <!-- Movies (watched) -->
+        <section>
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-xl font-bold">Movies</h2>
+            <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+            </svg>
+          </div>
+          <div v-if="profileWatchedMovies.length > 0" class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+            <div
+              v-for="[media] in profileWatchedMovies"
+              :key="media.media_id"
+              class="flex-shrink-0 w-24 cursor-pointer"
+              @click="openMediaDetails(media)"
+            >
+              <img
+                :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
+                :alt="media.title"
+                class="w-full aspect-[2/3] object-cover rounded-md bg-gray-200"
+              />
+            </div>
+          </div>
+          <div v-else class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+            <div v-for="n in 4" :key="n" class="flex-shrink-0 w-24 aspect-[2/3] rounded-md bg-gray-200"></div>
+          </div>
+        </section>
+
+        <!-- Favorite movies (empty for now) -->
+        <section>
+          <div class="flex items-center gap-2 mb-3">
+            <svg class="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+            </svg>
+            <h2 class="text-xl font-bold">Favorite movies</h2>
+          </div>
+          <div class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+            <div v-for="n in 4" :key="n" class="flex-shrink-0 w-24 aspect-[2/3] rounded-md bg-gray-200"></div>
+          </div>
+        </section>
+      </div>
     </div>
     <!-- Fixed Bottom Navigation -->
     <div class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 flex justify-around items-center py-3 z-50">
