@@ -1819,6 +1819,71 @@ async fn reset_database(state: State<'_, AppState>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+
+// Tauri command: Export database backup
+#[tauri::command]
+async fn export_database(state: State<'_, AppState>) -> Result<String, String> {
+    let file_path = rfd::FileDialog::new()
+        .add_filter("SQLite Database", &["db"])
+        .set_file_name("tv-time-backup.db")
+        .save_file();
+
+    if let Some(path) = file_path {
+        let conn = state.db.lock().await;
+        let path_str = path.to_string_lossy();
+        
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+
+        conn.execute(&format!("VACUUM INTO '{}'", path_str.replace("'", "''")), [])
+            .map_err(|e| format!("Failed to export database: {}", e))?;
+        
+        Ok("Database exported successfully".to_string())
+    } else {
+        Err("Export cancelled by user".to_string())
+    }
+}
+
+// Tauri command: Import database backup
+#[tauri::command]
+async fn import_database(state: State<'_, AppState>) -> Result<String, String> {
+    let file_path = rfd::FileDialog::new()
+        .add_filter("SQLite Database", &["db"])
+        .pick_file();
+
+    if let Some(path) = file_path {
+        if !path.exists() {
+            return Err("Selected file does not exist".to_string());
+        }
+
+        let mut conn = state.db.lock().await;
+
+        // Open an in-memory database connection to release the lock on the physical file
+        let mem_conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        let old_conn = std::mem::replace(&mut *conn, mem_conn);
+        drop(old_conn); // Closes connection and releases file lock!
+
+        // Get the database path
+        let db_path = get_app_data_dir().join("tv-time-clone.db");
+
+        // Copy the backup file to the database location
+        std::fs::copy(&path, &db_path)
+            .map_err(|e| format!("Failed to restore database file: {}", e))?;
+
+        // Reopen the connection to the database file
+        let new_conn = Connection::open(&db_path)
+            .map_err(|e| format!("Failed to reopen database: {}", e))?;
+
+        // Replace the in-memory connection with the restored database connection
+        *conn = new_conn;
+
+        Ok("Database imported successfully".to_string())
+    } else {
+        Err("Import cancelled by user".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Create app data dir if it doesn't exist
@@ -1876,7 +1941,9 @@ pub fn run() {
             add_to_list,
             remove_from_list,
             get_list_items,
-            reset_database
+            reset_database,
+            export_database,
+            import_database
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
