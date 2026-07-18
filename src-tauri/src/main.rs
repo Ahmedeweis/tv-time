@@ -99,15 +99,28 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         )",
         [],
     )?;
-    // Add last_updated and number_of_seasons columns if they don't exist (for existing databases)
     conn.execute(
-        "ALTER TABLE media_cache ADD COLUMN last_updated TEXT",
+        "CREATE TABLE IF NOT EXISTS episodes (
+            media_id INTEGER NOT NULL,
+            season_number INTEGER NOT NULL,
+            episode_number INTEGER NOT NULL,
+            episode_name TEXT,
+            overview TEXT,
+            air_date TEXT,
+            still_path TEXT,
+            PRIMARY KEY (media_id, season_number, episode_number),
+            FOREIGN KEY (media_id, season_number) REFERENCES seasons(media_id, season_number)
+        )",
         [],
-    ).ok();
+    )?;
+    // Add last_updated and number_of_seasons columns if they don't exist (for existing databases)
+    conn.execute("ALTER TABLE media_cache ADD COLUMN last_updated TEXT", [])
+        .ok();
     conn.execute(
         "ALTER TABLE media_cache ADD COLUMN number_of_seasons INTEGER",
         [],
-    ).ok();
+    )
+    .ok();
     // Create favorites table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS user_favorites (
@@ -146,8 +159,8 @@ fn get_app_data_dir() -> std::path::PathBuf {
     // Get the current executable path to make the app portable
     let mut exe_path = std::env::current_exe().expect("Failed to get executable path");
     exe_path.pop(); // Remove the executable name to get its directory
-    // In development mode (npm run tauri dev), the exe is in src-tauri/target/debug.
-    // If we detect we are in 'debug', we will place the database in the main project root.
+                    // In development mode (npm run tauri dev), the exe is in src-tauri/target/debug.
+                    // If we detect we are in 'debug', we will place the database in the main project root.
     if exe_path.ends_with("debug") {
         // Pop target/debug
         exe_path.pop();
@@ -230,19 +243,106 @@ async fn get_tmdb_recommendations(
 }
 // Tauri command: Get TV seasons and episodes from TMDB
 #[tauri::command]
-async fn get_tv_seasons(media_id: i64) -> Result<serde_json::Value, String> {
+async fn get_tv_seasons(
+    media_id: i64,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    // Check if we have cached seasons first
+    {
+        let conn = state.db.lock().await;
+        // Check if we have cached seasons
+        let mut stmt = conn.prepare("SELECT season_number, season_name, episode_count, air_date, overview, poster_path FROM seasons WHERE media_id = ?1").map_err(|e| e.to_string())?;
+        let seasons = stmt
+            .query_map(params![media_id], |row| {
+                Ok(serde_json::json!({
+                    "season_number": row.get::<_, i64>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "episode_count": row.get::<_, i64>(2)?,
+                    "air_date": row.get::<_, Option<String>>(3)?,
+                    "overview": row.get::<_, Option<String>>(4)?,
+                    "poster_path": row.get::<_, Option<String>>(5)?
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut seasons_list = Vec::new();
+        for season in seasons {
+            seasons_list.push(season.map_err(|e| e.to_string())?);
+        }
+        if !seasons_list.is_empty() {
+            // Also get cached media data to return full show details
+            let media_data = conn
+                .query_row(
+                    "SELECT synopsis_cached_json_data FROM media_cache WHERE media_id = ?1",
+                    params![media_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(synopsis) = media_data {
+                if let Ok(mut show_json) = serde_json::from_str::<serde_json::Value>(&synopsis) {
+                    // Replace seasons with cached ones
+                    show_json["seasons"] = serde_json::json!(seasons_list);
+                    return Ok(show_json);
+                }
+            }
+            // Fallback: return just seasons in basic structure
+            return Ok(serde_json::json!({ "seasons": seasons_list }));
+        }
+    }
+
+    // No cached seasons, fetch from TMDB
     let client = reqwest::Client::new();
-    let url = format!(
-        "{}/tv/{}?api_key={}",
-        TMDB_BASE_URL, media_id, TMDB_API_KEY
-    );
+    let url = format!("{}/tv/{}?api_key={}", TMDB_BASE_URL, media_id, TMDB_API_KEY);
     let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
     let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
     Ok(json)
 }
 // Tauri command: Get episodes for a specific TV season
 #[tauri::command]
-async fn get_tv_season_episodes(media_id: i64, season_number: i64) -> Result<serde_json::Value, String> {
+async fn get_tv_season_episodes(
+    media_id: i64,
+    season_number: i64,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    // Check if we have cached episodes first
+    {
+        let conn = state.db.lock().await;
+        // Check if we have cached episodes
+        let mut stmt = conn.prepare("SELECT episode_number, episode_name, overview, air_date, still_path FROM episodes WHERE media_id = ?1 AND season_number = ?2 ORDER BY episode_number").map_err(|e| e.to_string())?;
+        let episodes = stmt
+            .query_map(params![media_id, season_number], |row| {
+                Ok(serde_json::json!({
+                    "episode_number": row.get::<_, i64>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "overview": row.get::<_, Option<String>>(2)?,
+                    "air_date": row.get::<_, Option<String>>(3)?,
+                    "still_path": row.get::<_, Option<String>>(4)?
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut episodes_list = Vec::new();
+        for episode in episodes {
+            episodes_list.push(episode.map_err(|e| e.to_string())?);
+        }
+        if !episodes_list.is_empty() {
+            // Also get season details from cache
+            let season = conn.query_row("SELECT season_number, season_name, episode_count, air_date, overview, poster_path FROM seasons WHERE media_id = ?1 AND season_number = ?2", params![media_id, season_number], |row| {
+                Ok(serde_json::json!({
+                    "season_number": row.get::<_, i64>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "episode_count": row.get::<_, i64>(2)?,
+                    "air_date": row.get::<_, Option<String>>(3)?,
+                    "overview": row.get::<_, Option<String>>(4)?,
+                    "poster_path": row.get::<_, Option<String>>(5)?
+                }))
+            }).optional().map_err(|e| e.to_string())?;
+            let mut result = season.unwrap_or_else(|| serde_json::json!({}));
+            result["episodes"] = serde_json::json!(episodes_list);
+            return Ok(result);
+        }
+    }
+
+    // If not cached, fetch from TMDB
     let client = reqwest::Client::new();
     let url = format!(
         "{}/tv/{}/season/{}?api_key={}",
@@ -290,17 +390,32 @@ async fn get_upcoming_episodes(state: State<'_, AppState>) -> Result<serde_json:
                     Ok(show_data) => {
                         if let Some(seasons) = show_data.get("seasons").and_then(|s| s.as_array()) {
                             for season in seasons {
-                                if let Some(season_number) = season.get("season_number").and_then(|s| s.as_i64()) {
-                                    if season_number > 0 { // Skip special seasons
+                                if let Some(season_number) =
+                                    season.get("season_number").and_then(|s| s.as_i64())
+                                {
+                                    if season_number > 0 {
+                                        // Skip special seasons
                                         // Fetch episodes for this season
-                                        let season_url = format!("{}/tv/{}/season/{}?api_key={}", TMDB_BASE_URL, media_id, season_number, TMDB_API_KEY);
+                                        let season_url = format!(
+                                            "{}/tv/{}/season/{}?api_key={}",
+                                            TMDB_BASE_URL, media_id, season_number, TMDB_API_KEY
+                                        );
                                         match client.get(&season_url).send().await {
                                             Ok(season_response) => {
-                                                match season_response.json::<serde_json::Value>().await {
+                                                match season_response
+                                                    .json::<serde_json::Value>()
+                                                    .await
+                                                {
                                                     Ok(season_data) => {
-                                                        if let Some(episodes) = season_data.get("episodes").and_then(|e| e.as_array()) {
+                                                        if let Some(episodes) = season_data
+                                                            .get("episodes")
+                                                            .and_then(|e| e.as_array())
+                                                        {
                                                             for episode in episodes {
-                                                                if let Some(air_date_str) = episode.get("air_date").and_then(|d| d.as_str()) {
+                                                                if let Some(air_date_str) = episode
+                                                                    .get("air_date")
+                                                                    .and_then(|d| d.as_str())
+                                                                {
                                                                     if let Ok(air_date) = chrono::NaiveDate::parse_from_str(air_date_str, "%Y-%m-%d") {
                                                                         if air_date >= today {
                                                                             let episode_number = episode.get("episode_number").and_then(|e| e.as_i64()).unwrap_or(0);
@@ -351,17 +466,21 @@ async fn get_upcoming_episodes(state: State<'_, AppState>) -> Result<serde_json:
 }
 // Tauri command: Get next episode to watch for each TV show
 #[tauri::command]
-async fn get_next_episodes_to_watch(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn get_next_episodes_to_watch(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let (shows_with_last_watched, shows_havent_started) = {
         let conn = state.db.lock().await;
         // Get all TV shows from watchlist
         let mut stmt = conn
-            .prepare("
+            .prepare(
+                "
                 SELECT mc.media_id, mc.title, mc.poster_path
                 FROM media_cache mc
                 INNER JOIN user_watchlist uw ON mc.media_id = uw.media_id
                 WHERE mc.media_type = 'tv'
-            ")
+            ",
+            )
             .map_err(|e| e.to_string())?;
         let shows = stmt
             .query_map([], |row| {
@@ -378,13 +497,15 @@ async fn get_next_episodes_to_watch(state: State<'_, AppState>) -> Result<serde_
             if let Ok((media_id, title, poster_path)) = show_result {
                 // Get the last watched episode for this show
                 let mut last_stmt = conn
-                    .prepare("
+                    .prepare(
+                        "
                         SELECT season_number, episode_number
                         FROM watched_episodes
                         WHERE media_id = ?1
                         ORDER BY season_number DESC, episode_number DESC
                         LIMIT 1
-                    ")
+                    ",
+                    )
                     .map_err(|e| e.to_string())?;
                 let last_watched = last_stmt
                     .query_row(params![media_id], |row| {
@@ -413,22 +534,45 @@ async fn get_next_episodes_to_watch(state: State<'_, AppState>) -> Result<serde_
                         if let Some(seasons) = show_data.get("seasons").and_then(|s| s.as_array()) {
                             let mut found_next = false;
                             for season in seasons {
-                                if found_next { break; }
-                                if let Some(season_number) = season.get("season_number").and_then(|s| s.as_i64()) {
+                                if found_next {
+                                    break;
+                                }
+                                if let Some(season_number) =
+                                    season.get("season_number").and_then(|s| s.as_i64())
+                                {
                                     if season_number > 0 {
                                         // Fetch episodes for this season
-                                        let season_url = format!("{}/tv/{}/season/{}?api_key={}", TMDB_BASE_URL, media_id, season_number, TMDB_API_KEY);
+                                        let season_url = format!(
+                                            "{}/tv/{}/season/{}?api_key={}",
+                                            TMDB_BASE_URL, media_id, season_number, TMDB_API_KEY
+                                        );
                                         match client.get(&season_url).send().await {
                                             Ok(season_response) => {
-                                                match season_response.json::<serde_json::Value>().await {
+                                                match season_response
+                                                    .json::<serde_json::Value>()
+                                                    .await
+                                                {
                                                     Ok(season_data) => {
-                                                        if let Some(episodes) = season_data.get("episodes").and_then(|e| e.as_array()) {
+                                                        if let Some(episodes) = season_data
+                                                            .get("episodes")
+                                                            .and_then(|e| e.as_array())
+                                                        {
                                                             for episode in episodes {
-                                                                if let Some(ep_number) = episode.get("episode_number").and_then(|e| e.as_i64()) {
+                                                                if let Some(ep_number) = episode
+                                                                    .get("episode_number")
+                                                                    .and_then(|e| e.as_i64())
+                                                                {
                                                                     match last_watched {
-                                                                        Some((last_season, last_episode)) => {
+                                                                        Some((
+                                                                            last_season,
+                                                                            last_episode,
+                                                                        )) => {
                                                                             // Find the next episode after the last watched one
-                                                                            if season_number == last_season && ep_number > last_episode {
+                                                                            if season_number
+                                                                                == last_season
+                                                                                && ep_number
+                                                                                    > last_episode
+                                                                            {
                                                                                 let episode_name = episode.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                                                                                 let still_path = episode.get("still_path").and_then(|p| p.as_str()).map(|s| s.to_string());
                                                                                 let air_date = episode.get("air_date").and_then(|d| d.as_str()).map(|s| s.to_string());
@@ -444,7 +588,9 @@ async fn get_next_episodes_to_watch(state: State<'_, AppState>) -> Result<serde_
                                                                                 }));
                                                                                 found_next = true;
                                                                                 break;
-                                                                            } else if season_number > last_season {
+                                                                            } else if season_number
+                                                                                > last_season
+                                                                            {
                                                                                 // First episode of next season
                                                                                 let episode_name = episode.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                                                                                 let still_path = episode.get("still_path").and_then(|p| p.as_str()).map(|s| s.to_string());
@@ -465,7 +611,9 @@ async fn get_next_episodes_to_watch(state: State<'_, AppState>) -> Result<serde_
                                                                         }
                                                                         None => {
                                                                             // No episodes watched yet, show first episode of first season
-                                                                            if season_number == 1 && ep_number == 1 {
+                                                                            if season_number == 1
+                                                                                && ep_number == 1
+                                                                            {
                                                                                 let episode_name = episode.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                                                                                 let still_path = episode.get("still_path").and_then(|p| p.as_str()).map(|s| s.to_string());
                                                                                 let air_date = episode.get("air_date").and_then(|d| d.as_str()).map(|s| s.to_string());
@@ -664,34 +812,164 @@ async fn add_media_to_watchlist(
     } else {
         serde_json::Value::Null // Not needed, already cached
     };
+
+    // If it's a TV show, fetch seasons and episodes (without holding DB lock!)
+    let tv_data: Option<(Vec<serde_json::Value>, Option<serde_json::Value>)> = if media_type == "tv"
+    {
+        let client = reqwest::Client::new();
+        let url = format!("{}/tv/{}?api_key={}", TMDB_BASE_URL, media_id, TMDB_API_KEY);
+        let show_response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let show_json = show_response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(seasons_array) = show_json.get("seasons").and_then(|s| s.as_array()) {
+            let mut all_seasons = Vec::new();
+            for season in seasons_array {
+                if let Some(season_number) = season.get("season_number").and_then(|s| s.as_i64()) {
+                    let season_url = format!(
+                        "{}/tv/{}/season/{}?api_key={}",
+                        TMDB_BASE_URL, media_id, season_number, TMDB_API_KEY
+                    );
+                    let season_response = client
+                        .get(&season_url)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let season_json = season_response
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    all_seasons.push(season_json);
+
+                    // Rate limiting to avoid hitting TMDB limits
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+            Some((all_seasons, Some(show_json)))
+        } else {
+            Some((Vec::new(), Some(show_json)))
+        }
+    } else {
+        None
+    };
+
     // Now get lock and update DB
     let conn = state.db.lock().await;
     if cached.is_none() {
+        let json_to_use = if media_type == "tv" && tv_data.is_some() {
+            tv_data.as_ref().unwrap().1.clone().unwrap()
+        } else {
+            media_json
+        };
+
         // Cache the newly fetched media
         let title = match media_type.as_str() {
-            "movie" => media_json.get("title").and_then(|t| t.as_str()),
-            "tv" => media_json.get("name").and_then(|t| t.as_str()),
+            "movie" => json_to_use.get("title").and_then(|t| t.as_str()),
+            "tv" => json_to_use.get("name").and_then(|t| t.as_str()),
             _ => None,
         }
         .unwrap_or("")
         .to_string();
-        let poster_path = media_json
+        let poster_path = json_to_use
             .get("poster_path")
             .and_then(|p| p.as_str())
             .map(|s| s.to_string());
         let release_date = match media_type.as_str() {
-            "movie" => media_json.get("release_date"),
-            "tv" => media_json.get("first_air_date"),
+            "movie" => json_to_use.get("release_date"),
+            "tv" => json_to_use.get("first_air_date"),
             _ => None,
         }
         .and_then(|r| r.as_str())
         .map(|s| s.to_string());
-        let synopsis_json = serde_json::to_string(&media_json).unwrap();
+        let synopsis_json = serde_json::to_string(&json_to_use).unwrap();
+        let number_of_seasons = if media_type == "tv" {
+            json_to_use
+                .get("number_of_seasons")
+                .and_then(|n| n.as_i64())
+        } else {
+            None
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+
         conn.execute(
-            "INSERT OR REPLACE INTO media_cache (media_id, title, poster_path, media_type, release_date, synopsis_cached_json_data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![media_id, title, poster_path, media_type, release_date, synopsis_json],
+            "INSERT OR REPLACE INTO media_cache (media_id, title, poster_path, media_type, release_date, synopsis_cached_json_data, last_updated, number_of_seasons)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![media_id, title, poster_path, media_type, release_date, synopsis_json, now, number_of_seasons],
         ).map_err(|e| e.to_string())?;
+
+        // If it's a TV show, save seasons and episodes
+        if media_type == "tv" && tv_data.is_some() {
+            for season_json in tv_data.unwrap().0 {
+                if let Some(season_number) =
+                    season_json.get("season_number").and_then(|s| s.as_i64())
+                {
+                    let season_name = season_json
+                        .get("name")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let episode_count = season_json
+                        .get("episodes")
+                        .and_then(|e| e.as_array())
+                        .map(|a| a.len() as i64)
+                        .unwrap_or(0);
+                    let air_date = season_json
+                        .get("air_date")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string());
+                    let overview = season_json
+                        .get("overview")
+                        .and_then(|o| o.as_str())
+                        .map(|s| s.to_string());
+                    let poster_path = season_json
+                        .get("poster_path")
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string());
+
+                    conn.execute(
+                        "INSERT OR REPLACE INTO seasons (media_id, season_number, season_name, episode_count, air_date, overview, poster_path)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![media_id, season_number, season_name, episode_count, air_date, overview, poster_path],
+                    ).ok();
+
+                    if let Some(episodes_array) =
+                        season_json.get("episodes").and_then(|e| e.as_array())
+                    {
+                        for episode in episodes_array {
+                            if let Some(episode_number) =
+                                episode.get("episode_number").and_then(|e| e.as_i64())
+                            {
+                                let episode_name = episode
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let overview = episode
+                                    .get("overview")
+                                    .and_then(|o| o.as_str())
+                                    .map(|s| s.to_string());
+                                let air_date = episode
+                                    .get("air_date")
+                                    .and_then(|d| d.as_str())
+                                    .map(|s| s.to_string());
+                                let still_path = episode
+                                    .get("still_path")
+                                    .and_then(|p| p.as_str())
+                                    .map(|s| s.to_string());
+
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO episodes (media_id, season_number, episode_number, episode_name, overview, air_date, still_path)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    params![media_id, season_number, episode_number, episode_name, overview, air_date, still_path],
+                                ).ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     // Add to watchlist
     conn.execute(
@@ -731,6 +1009,16 @@ async fn remove_from_watchlist(media_id: i64, state: State<'_, AppState>) -> Res
     let conn = state.db.lock().await;
     conn.execute(
         "DELETE FROM user_watchlist WHERE media_id = ?1",
+        params![media_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM user_favorites WHERE media_id = ?1",
+        params![media_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM list_items WHERE media_id = ?1",
         params![media_id],
     )
     .map_err(|e| e.to_string())?;
@@ -910,9 +1198,11 @@ async fn check_for_new_seasons(db: Arc<Mutex<Connection>>) {
     let should_check = {
         let conn = db.lock().await;
         let last_check: Option<String> = conn
-            .query_row("SELECT last_updated FROM media_cache WHERE media_type = 'tv' LIMIT 1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT last_updated FROM media_cache WHERE media_type = 'tv' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(|e| {
                 eprintln!("Error checking last update time: {}", e);
@@ -975,13 +1265,18 @@ async fn check_for_new_seasons(db: Arc<Mutex<Connection>>) {
             Ok(response) => {
                 match response.json::<serde_json::Value>().await {
                     Ok(json) => {
-                        if let Some(new_seasons) = json.get("number_of_seasons").and_then(|s| s.as_i64()) {
+                        if let Some(new_seasons) =
+                            json.get("number_of_seasons").and_then(|s| s.as_i64())
+                        {
                             let has_new_season = match current_seasons {
                                 Some(current) => new_seasons > current,
                                 None => true,
                             };
                             if has_new_season {
-                                println!("NEW SEASON DETECTED for {}: {} seasons (was {:?})", title, new_seasons, current_seasons);
+                                println!(
+                                    "NEW SEASON DETECTED for {}: {} seasons (was {:?})",
+                                    title, new_seasons, current_seasons
+                                );
                                 // Update media_cache
                                 let now = chrono::Utc::now().to_rfc3339();
                                 {
@@ -992,16 +1287,37 @@ async fn check_for_new_seasons(db: Arc<Mutex<Connection>>) {
                                     ).ok();
                                 }
                                 // Fetch and cache seasons data
-                                if let Some(seasons_array) = json.get("seasons").and_then(|s| s.as_array()) {
+                                if let Some(seasons_array) =
+                                    json.get("seasons").and_then(|s| s.as_array())
+                                {
                                     let conn = db.lock().await;
                                     for season in seasons_array {
-                                        if let Some(season_number) = season.get("season_number").and_then(|s| s.as_i64()) {
-                                            if season_number > 0 { // Skip special seasons (season 0)
-                                                let season_name = season.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                                                let episode_count = season.get("episode_count").and_then(|e| e.as_i64()).unwrap_or(0);
-                                                let air_date = season.get("air_date").and_then(|d| d.as_str()).map(|s| s.to_string());
-                                                let overview = season.get("overview").and_then(|o| o.as_str()).map(|s| s.to_string());
-                                                let poster_path = season.get("poster_path").and_then(|p| p.as_str()).map(|s| s.to_string());
+                                        if let Some(season_number) =
+                                            season.get("season_number").and_then(|s| s.as_i64())
+                                        {
+                                            if season_number > 0 {
+                                                // Skip special seasons (season 0)
+                                                let season_name = season
+                                                    .get("name")
+                                                    .and_then(|s| s.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                let episode_count = season
+                                                    .get("episode_count")
+                                                    .and_then(|e| e.as_i64())
+                                                    .unwrap_or(0);
+                                                let air_date = season
+                                                    .get("air_date")
+                                                    .and_then(|d| d.as_str())
+                                                    .map(|s| s.to_string());
+                                                let overview = season
+                                                    .get("overview")
+                                                    .and_then(|o| o.as_str())
+                                                    .map(|s| s.to_string());
+                                                let poster_path = season
+                                                    .get("poster_path")
+                                                    .and_then(|p| p.as_str())
+                                                    .map(|s| s.to_string());
                                                 conn.execute(
                                                     "INSERT OR REPLACE INTO seasons (media_id, season_number, season_name, episode_count, air_date, overview, poster_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                                                     params![media_id, season_number, season_name, episode_count, air_date, overview, poster_path],
@@ -1201,22 +1517,26 @@ struct FavoriteItem {
 #[tauri::command]
 async fn toggle_favorite(
     media_id: i64,
-    media_type: String,
+    _media_type: String,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     let conn = state.db.lock().await;
     // Check if already favorited
-    let exists = conn.query_row(
-        "SELECT 1 FROM user_favorites WHERE media_id = ?1",
-        params![media_id],
-        |_| Ok(()),
-    ).optional().map_err(|e| e.to_string())?;
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM user_favorites WHERE media_id = ?1",
+            params![media_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
     if exists.is_some() {
         // Remove from favorites
         conn.execute(
             "DELETE FROM user_favorites WHERE media_id = ?1",
             params![media_id],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
         Ok(false) // Not favorited anymore
     } else {
         // Add to favorites
@@ -1224,18 +1544,22 @@ async fn toggle_favorite(
         conn.execute(
             "INSERT OR IGNORE INTO user_favorites (media_id, added_at) VALUES (?1, ?2)",
             params![media_id, now],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
         Ok(true) // Now favorited
     }
 }
 #[tauri::command]
 async fn is_favorite(media_id: i64, state: State<'_, AppState>) -> Result<bool, String> {
     let conn = state.db.lock().await;
-    let exists = conn.query_row(
-        "SELECT 1 FROM user_favorites WHERE media_id = ?1",
-        params![media_id],
-        |_| Ok(()),
-    ).optional().map_err(|e| e.to_string())?;
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM user_favorites WHERE media_id = ?1",
+            params![media_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
     Ok(exists.is_some())
 }
 #[tauri::command]
@@ -1292,7 +1616,8 @@ async fn create_list(name: String, state: State<'_, AppState>) -> Result<UserLis
     conn.execute(
         "INSERT INTO user_lists (name, created_at, updated_at) VALUES (?1, ?2, ?3)",
         params![name, now, now],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     let list_id = conn.last_insert_rowid();
     Ok(UserList {
         list_id,
@@ -1309,16 +1634,23 @@ async fn rename_list(list_id: i64, name: String, state: State<'_, AppState>) -> 
     conn.execute(
         "UPDATE user_lists SET name = ?1, updated_at = ?2 WHERE list_id = ?3",
         params![name, now, list_id],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 #[tauri::command]
 async fn delete_list(list_id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let conn = state.db.lock().await;
-    conn.execute("DELETE FROM list_items WHERE list_id = ?1", params![list_id])
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM user_lists WHERE list_id = ?1", params![list_id])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM list_items WHERE list_id = ?1",
+        params![list_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM user_lists WHERE list_id = ?1",
+        params![list_id],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 #[tauri::command]
@@ -1329,7 +1661,7 @@ async fn get_lists(state: State<'_, AppState>) -> Result<Vec<UserList>, String> 
             "SELECT ul.list_id, ul.name, ul.created_at, ul.updated_at,
                     (SELECT COUNT(*) FROM list_items li WHERE li.list_id = ul.list_id) as item_count
              FROM user_lists ul
-             ORDER BY ul.updated_at DESC"
+             ORDER BY ul.updated_at DESC",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -1350,7 +1682,12 @@ async fn get_lists(state: State<'_, AppState>) -> Result<Vec<UserList>, String> 
     Ok(result)
 }
 #[tauri::command]
-async fn add_to_list(list_id: i64, media_id: i64, media_type: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn add_to_list(
+    list_id: i64,
+    media_id: i64,
+    media_type: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     // Check if media is cached (with lock held briefly)
     let is_cached = {
         let conn = state.db.lock().await;
@@ -1358,7 +1695,10 @@ async fn add_to_list(list_id: i64, media_id: i64, media_type: String, state: Sta
             "SELECT 1 FROM media_cache WHERE media_id = ?1",
             params![media_id],
             |_| Ok(()),
-        ).optional().map_err(|e| e.to_string())?.is_some()
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .is_some()
     };
     if !is_cached {
         // Fetch and cache media (without lock)
@@ -1368,13 +1708,20 @@ async fn add_to_list(list_id: i64, media_id: i64, media_type: String, state: Sta
             "movie" => media_json.get("title").and_then(|t| t.as_str()),
             "tv" => media_json.get("name").and_then(|t| t.as_str()),
             _ => None,
-        }.unwrap_or("").to_string();
-        let poster_path = media_json.get("poster_path").and_then(|p| p.as_str()).map(|s| s.to_string());
+        }
+        .unwrap_or("")
+        .to_string();
+        let poster_path = media_json
+            .get("poster_path")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string());
         let release_date = match media_type.as_str() {
             "movie" => media_json.get("release_date"),
             "tv" => media_json.get("first_air_date"),
             _ => None,
-        }.and_then(|r| r.as_str()).map(|s| s.to_string());
+        }
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string());
         let synopsis_json = serde_json::to_string(&media_json).unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO media_cache (media_id, title, poster_path, media_type, release_date, synopsis_cached_json_data)
@@ -1387,26 +1734,34 @@ async fn add_to_list(list_id: i64, media_id: i64, media_type: String, state: Sta
     conn.execute(
         "INSERT OR IGNORE INTO list_items (list_id, media_id, added_at) VALUES (?1, ?2, ?3)",
         params![list_id, media_id, now],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     // Update list updated_at
     conn.execute(
         "UPDATE user_lists SET updated_at = ?1 WHERE list_id = ?2",
         params![now, list_id],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 #[tauri::command]
-async fn remove_from_list(list_id: i64, media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+async fn remove_from_list(
+    list_id: i64,
+    media_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let conn = state.db.lock().await;
     conn.execute(
         "DELETE FROM list_items WHERE list_id = ?1 AND media_id = ?2",
         params![list_id, media_id],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "UPDATE user_lists SET updated_at = ?1 WHERE list_id = ?2",
         params![now, list_id],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 #[tauri::command]
@@ -1439,6 +1794,31 @@ async fn get_list_items(list_id: i64, state: State<'_, AppState>) -> Result<Vec<
     }
     Ok(result)
 }
+// Tauri command: Reset the entire database
+#[tauri::command]
+async fn reset_database(state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    // Delete all data from tables (in reverse order of dependencies)
+    conn.execute("DELETE FROM list_items", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM user_lists", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM user_favorites", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM watched_episodes", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM episodes", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM seasons", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM user_watchlist", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM media_cache", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM tmdb_auth", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Create app data dir if it doesn't exist
@@ -1451,9 +1831,7 @@ pub fn run() {
     let db_arc_for_task = db_arc.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init()) // Add shell plugin!
-        .manage(AppState {
-            db: db_arc,
-        })
+        .manage(AppState { db: db_arc })
         .setup(move |_app| {
             // Spawn background task for season updates after app is setup
             tauri::async_runtime::spawn(async move {
@@ -1497,7 +1875,8 @@ pub fn run() {
             get_lists,
             add_to_list,
             remove_from_list,
-            get_list_items
+            get_list_items,
+            reset_database
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

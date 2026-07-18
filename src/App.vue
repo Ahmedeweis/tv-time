@@ -68,6 +68,7 @@ const expandedSeason = ref<number | null>(null);
 const seasonEpisodes = ref<any[]>([]);
 const upcomingEpisodes = ref<any[]>([]);
 const nextEpisodesToWatch = ref<any[]>([]);
+const isLoadingNextEpisodes = ref(true);
 const favoriteMediaIds = ref<Set<number>>(new Set());
 const favoriteItems = ref<FavoriteItem[]>([]);
 interface FavoriteItem {
@@ -127,24 +128,30 @@ const showsUpcoming = computed(() => {
   return upcomingWatchlist.value.filter(m => m[0].media_type === 'tv');
 });
 const profileWatchedMovies = computed(() => watchedReleased.value);
-const profileCompletedShows = computed(() => {
+// All TV shows in watchlist (not started + in-progress + finished)
+const profileAllShows = computed(() => {
+  return releasedWatchlist.value.filter(([media]) => media.media_type === 'tv');
+});
+// Determine a show's display status
+const getShowStatus = (media: MediaCache, wl: UserWatchlistItem): 'not_started' | 'watching' | 'finished' => {
+  const watchedCount = wl.watched_episode_count ?? 0;
+  if (watchedCount === 0) return 'not_started';
+  try {
+    const data = JSON.parse(media.synopsis_cached_json_data || '{}');
+    const total = data.number_of_episodes;
+    if (typeof total === 'number' && total > 0 && watchedCount >= total) return 'finished';
+  } catch { /* ignore */ }
+  return 'watching';
+};
+// Done TV shows: in watchlist + has watched episodes + no next episode remaining
+const showsDone = computed(() => {
   const nextIds = new Set(nextEpisodesToWatch.value.map((ep: any) => ep.media_id));
   return releasedWatchlist.value.filter(([media, wl]) => {
     if (media.media_type !== 'tv') return false;
     const watchedCount = wl.watched_episode_count ?? 0;
     if (watchedCount <= 0) return false;
-    // No next episode left = finished the show
-    if (!nextIds.has(media.media_id)) return true;
-    try {
-      const data = JSON.parse(media.synopsis_cached_json_data || '{}');
-      const total = data.number_of_episodes;
-      if (typeof total === 'number' && total > 0) {
-        return watchedCount >= total;
-      }
-    } catch {
-      // ignore parse errors
-    }
-    return false;
+    // Not in next-to-watch list means no more episodes to watch = done
+    return !nextIds.has(media.media_id);
   });
 });
 const profileEpisodesWatched = computed(() =>
@@ -428,6 +435,28 @@ const confirmUnwatchSeason = () => {
     seasonToUnwatch.value = null;
   }
 };
+const showResetConfirm = ref(false);
+const resetDatabase = async () => {
+  try {
+    await invoke('reset_database');
+    // Reset all reactive state on the frontend too!
+    searchResults.value = [];
+    selectedMedia.value = null;
+    currentPage.value = 'home';
+    activeDetailsTab.value = 'about';
+    activeWatchlistTab.value = 'upcoming';
+    watchedEpisodes.value = new Set();
+    showResetConfirm.value = false;
+    // Reload everything!
+    await loadDashboard();
+    await loadNextEpisodesToWatch();
+    await loadUserProfile();
+    await loadFavorites();
+    await loadLists();
+  } catch (error) {
+    console.error('Reset database error:', error);
+  }
+};
 const search = async () => {
   if (!searchQuery.value.trim()) return;
   loading.value = true;
@@ -459,9 +488,16 @@ const addToWatchlist = async (mediaId: number, mediaType: string) => {
 };
 const removeFromWatchlist = async (mediaId: number, mediaType: string) => {
   try {
+    const wasFavorite = favoriteMediaIds.value.has(mediaId);
     await invoke('remove_from_watchlist', { mediaId });
     if (tmdbSessionId.value) {
       await toggleTmdbWatchlist(mediaId, mediaType, false);
+      if (wasFavorite) {
+        await toggleTmdbFavorite(mediaId, mediaType, false);
+      }
+    }
+    if (wasFavorite) {
+      await loadFavorites();
     }
     await loadDashboard();
   } catch (error) {
@@ -509,11 +545,14 @@ const loadUpcomingEpisodes = async () => {
   }
 };
 const loadNextEpisodesToWatch = async () => {
+  isLoadingNextEpisodes.value = true;
   try {
     const result = await invoke('get_next_episodes_to_watch');
     nextEpisodesToWatch.value = result.next_episodes || [];
   } catch (error) {
     console.error('Load next episodes to watch error:', error);
+  } finally {
+    isLoadingNextEpisodes.value = false;
   }
 };
 const getDaysUntilRelease = (releaseDate: string | null) => {
@@ -991,6 +1030,38 @@ onMounted(async () => {
             </div>
           </div>
           <p v-else class="text-gray-400 text-center mb-8">No shows to start.</p>
+        </div>
+        <!-- Done section -->
+        <div class="mt-8 text-center">
+          <h2 class="text-sm font-bold bg-green-500 text-white rounded-full px-4 py-1 inline-block mb-4 mx-auto block w-max">DONE</h2>
+          <div v-if="isLoadingNextEpisodes" class="grid grid-cols-6 gap-2">
+            <div v-for="n in 6" :key="n" class="aspect-[2/3] rounded-lg bg-gray-200 animate-pulse"></div>
+          </div>
+          <div v-else-if="showsDone.length > 0" class="grid grid-cols-6 gap-2">
+            <div
+              v-for="[media] in showsDone"
+              :key="media.media_id"
+              class="flex flex-col items-center cursor-pointer relative"
+              @click="openMediaDetails(media, 'tv')"
+            >
+              <div class="relative w-full">
+                <img
+                  :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
+                  :alt="media.title"
+                  class="w-full aspect-[2/3] object-cover rounded-lg"
+                />
+                <!-- Green checkmark overlay -->
+                <div class="absolute inset-0 bg-green-500/20 rounded-lg flex items-center justify-center">
+                  <div class="w-7 h-7 bg-green-500 rounded-full flex items-center justify-center shadow-lg">
+                    <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/>
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p v-else class="text-gray-400 text-center mb-8">No finished shows yet.</p>
         </div>
       </div>
       <div v-else-if="activeShowsTab === 'upcoming'">
@@ -1521,6 +1592,27 @@ onMounted(async () => {
             </div>
           </div>
         </div>
+        <!-- Reset Database Confirmation Modal -->
+        <div v-if="showResetConfirm" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <div class="bg-white rounded-lg p-6 max-w-sm w-full">
+            <h3 class="text-lg font-bold mb-4 text-red-600">Reset Entire Database?</h3>
+            <p class="text-gray-600 mb-6">Are you sure you want to delete ALL your data? This cannot be undone!</p>
+            <div class="flex gap-3">
+              <button
+                @click="showResetConfirm = false"
+                class="flex-1 bg-gray-200 hover:bg-gray-300 text-black font-semibold py-3 rounded-lg"
+              >
+                Cancel
+              </button>
+              <button
+                @click="resetDatabase"
+                class="flex-1 bg-red-600 hover:bg-red-700 text-white font-semibold py-3 rounded-lg"
+              >
+                Yes, Reset Everything
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
       <button
         v-if="!watchlistMediaIds.has(selectedMedia.id)"
@@ -1740,23 +1832,39 @@ onMounted(async () => {
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
             </svg>
           </div>
-          <div v-if="profileCompletedShows.length > 0" class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
-            <div
-              v-for="[media] in profileCompletedShows"
-              :key="media.media_id"
-              class="flex-shrink-0 w-24 cursor-pointer"
-              @click="openMediaDetails(media, 'tv')"
-            >
-              <img
-                :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
-                :alt="media.title"
-                class="w-full aspect-[2/3] object-cover rounded-md bg-gray-200"
-              />
+          <!-- Loading skeleton while next-episodes are being fetched -->
+          <div v-if="isLoadingNextEpisodes" class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+            <div v-for="n in 4" :key="n" class="flex-shrink-0 w-24 aspect-[2/3] rounded-md bg-gray-200 animate-pulse"></div>
+          </div>
+          <!-- Shows list once loaded -->
+          <template v-else>
+            <div v-if="profileAllShows.length > 0" class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+              <div
+                v-for="[media, wl] in profileAllShows"
+                :key="media.media_id"
+                class="flex-shrink-0 w-24 cursor-pointer relative"
+                @click="openMediaDetails(media, 'tv')"
+              >
+                <img
+                  :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
+                  :alt="media.title"
+                  class="w-full aspect-[2/3] object-cover rounded-md bg-gray-200"
+                />
+                <!-- Status badge -->
+                <span
+                  class="absolute top-1 right-1 text-[9px] font-bold px-1.5 py-0.5 rounded-full shadow"
+                  :class="{
+                    'bg-gray-500 text-white': getShowStatus(media, wl) === 'not_started',
+                    'bg-yellow-400 text-black': getShowStatus(media, wl) === 'watching',
+                    'bg-green-500 text-white': getShowStatus(media, wl) === 'finished',
+                  }"
+                >
+                  {{ getShowStatus(media, wl) === 'not_started' ? 'New' : getShowStatus(media, wl) === 'watching' ? 'Watching' : 'Done' }}
+                </span>
+              </div>
             </div>
-          </div>
-          <div v-else class="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
-            <div v-for="n in 4" :key="n" class="flex-shrink-0 w-24 aspect-[2/3] rounded-md bg-gray-200"></div>
-          </div>
+            <p v-else class="text-sm text-gray-400">No shows added yet. Search and add some!</p>
+          </template>
         </section>
         <!-- Favorite shows -->
         <section>
