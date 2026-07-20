@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue';
 import { useRoute } from 'vue-router';
 import moviesIcon from './assets/movies.png';
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
@@ -61,6 +61,13 @@ const watchedEpisodes = ref<Set<string>>(new Set());
 const similarMedia = ref<any[]>([]);
 const similarScrollRef = ref<HTMLElement | null>(null);
 const mediaHistory = ref<any[]>([]); // Track history for back button navigation
+const scrollPositions = ref<Record<string, number>>({}); // Store scroll positions for each page
+const homePageContainerRef = ref<HTMLElement | null>(null); // Ref for home page scroll container
+const profilePageContainerRef = ref<HTMLElement | null>(null); // Ref for profile page scroll container
+const showsPageContainerRef = ref<HTMLElement | null>(null); // Ref for shows page scroll container
+const listsPageContainerRef = ref<HTMLElement | null>(null); // Ref for lists page scroll container
+const listViewPageContainerRef = ref<HTMLElement | null>(null); // Ref for list view page scroll container
+const discoverPageContainerRef = ref<HTMLElement | null>(null); // Ref for discover page scroll container
 const activeDetailsTab = ref<'about' | 'more' | 'episodes'>('about');
 const activeShowsTab = ref<'watchlist' | 'upcoming'>('watchlist');
 const trailerVideo = ref<any>(null);
@@ -137,37 +144,95 @@ const watchlistMediaIds = computed(() => {
 });
 const watchedReleased = computed(() => releasedWatchlist.value.filter(m => m[1].status === 'watched' && m[0].media_type !== 'tv'));
 const unwatchedReleased = computed(() => releasedWatchlist.value.filter(m => m[1].status === 'to_watch' && m[0].media_type !== 'tv'));
-// Helper to sort and group movies by release year
-const groupMoviesByYear = (movies: [MediaCache, UserWatchlistItem][]) => {
-  // Sort movies in descending order of release date first
-  const sorted = [...movies].sort((a, b) => {
-    const dateA = a[0].release_date ? new Date(a[0].release_date).getTime() : 0;
-    const dateB = b[0].release_date ? new Date(b[0].release_date).getTime() : 0;
-    return dateB - dateA; // Newest first
-  });
-  // Group by year
-  const grouped = new Map<string, [MediaCache, UserWatchlistItem][]>();
-  for (const movie of sorted) {
-    const year = movie[0].release_date
-      ? new Date(movie[0].release_date).getFullYear().toString()
-      : 'Unknown';
-    if (!grouped.has(year)) {
-      grouped.set(year, []);
+// Helper to sort and smart group movies by ranges
+const groupMoviesBySmartRanges = (movies: [MediaCache, UserWatchlistItem][]) => {
+  // Step 1: Separate known and unknown release dates
+  const known = [];
+  const unknown = [];
+  for (const movie of movies) {
+    if (movie[0].release_date) {
+      known.push(movie);
+    } else {
+      unknown.push(movie);
     }
-    grouped.get(year)!.push(movie);
   }
-  // Sort years in descending order (newest first)
-  const sortedYears = Array.from(grouped.keys()).sort((a, b) => {
-    if (a === 'Unknown') return 1;
-    if (b === 'Unknown') return -1;
-    return parseInt(b) - parseInt(a);
+  // Step 2: Sort known movies descending
+  const sortedKnown = [...known].sort((a, b) => {
+    const dateA = new Date(a[0].release_date!).getTime();
+    const dateB = new Date(b[0].release_date!).getTime();
+    return dateB - dateA;
   });
-  // Convert to array of [year, movies] for easy iteration in template
-  return sortedYears.map(year => [year, grouped.get(year)!] as [string, [MediaCache, UserWatchlistItem][]]);
+  // Step3: Group known by year first
+  const yearGroups = new Map<number, [MediaCache, UserWatchlistItem][]>();
+  for (const movie of sortedKnown) {
+    const year = new Date(movie[0].release_date!).getFullYear();
+    if (!yearGroups.has(year)) {
+      yearGroups.set(year, []);
+    }
+    yearGroups.get(year)!.push(movie);
+  }
+  // Step4: Sort years descending
+  const sortedYears = Array.from(yearGroups.keys()).sort((a, b) => b - a);
+  // Step5: Create buckets (smart grouping)
+  const buckets: Array<{label: string, movies: [MediaCache, UserWatchlistItem][]}> = [];
+  let currentBucket: {minYear: number, maxYear: number, movies: [MediaCache, UserWatchlistItem][]} | null = null;
+  const MIN_BUCKET_SIZE = 5; // Minimum number of movies per bucket (except last)
+  for (const year of sortedYears) {
+    const moviesInYear = yearGroups.get(year)!;
+    const yearCount = moviesInYear.length;
+    if (yearCount > 4) {
+      // If current bucket exists, close it first!
+      if (currentBucket) {
+        buckets.push({
+          label: `${currentBucket.maxYear} - ${currentBucket.minYear}`,
+          movies: currentBucket.movies
+        });
+        currentBucket = null;
+      }
+      // Add standalone year bucket!
+      buckets.push({label: year.toString(), movies: moviesInYear});
+    } else {
+      // Add to current bucket or create new!
+      if (!currentBucket) {
+        currentBucket = {
+          minYear: year,
+          maxYear: year,
+          movies: [...moviesInYear]
+        };
+      } else {
+        // Check if adding would exceed or hit min size
+        const newCount = currentBucket.movies.length + yearCount;
+        if (newCount >= MIN_BUCKET_SIZE) {
+          // Close current bucket!
+          buckets.push({
+            label: `${currentBucket.maxYear} - ${year}`,
+            movies: [...currentBucket.movies, ...moviesInYear]
+          });
+          currentBucket = null;
+        } else {
+          // Add to current!
+          currentBucket.minYear = year;
+          currentBucket.movies.push(...moviesInYear);
+        }
+      }
+    }
+  }
+  // Add any remaining movies in current bucket!
+  if (currentBucket) {
+    buckets.push({
+      label: `${currentBucket.maxYear} - ${currentBucket.minYear}`,
+      movies: currentBucket.movies
+    });
+  }
+  // Finally add Unknown if any!
+  if (unknown.length > 0) {
+    buckets.push({label: 'Unknown', movies: unknown});
+  }
+  return buckets;
 };
 // Grouped and sorted movies for UI
-const groupedWatchedMovies = computed(() => groupMoviesByYear(watchedReleased.value));
-const groupedUnwatchedMovies = computed(() => groupMoviesByYear(unwatchedReleased.value));
+const groupedWatchedMovies = computed(() => groupMoviesBySmartRanges(watchedReleased.value));
+const groupedUnwatchedMovies = computed(() => groupMoviesBySmartRanges(unwatchedReleased.value));
 const showsWatchNext = computed(() => {
   return releasedWatchlist.value.filter(m => m[0].media_type === 'tv' && (m[1].watched_episode_count || 0) > 0);
 });
@@ -298,6 +363,46 @@ const scrollRight = () => {
     similarScrollRef.value.scrollBy({ left: 300, behavior: 'smooth' });
   }
 };
+const restoreScrollPosition = (page: string) => {
+  nextTick(() => {
+    if (page === 'home' && homePageContainerRef.value && scrollPositions.value['home'] !== undefined) {
+      homePageContainerRef.value.scrollTop = scrollPositions.value['home'];
+    } else if (page === 'profile' && profilePageContainerRef.value && scrollPositions.value['profile'] !== undefined) {
+      profilePageContainerRef.value.scrollTop = scrollPositions.value['profile'];
+    } else if (page === 'shows' && showsPageContainerRef.value && scrollPositions.value['shows'] !== undefined) {
+      showsPageContainerRef.value.scrollTop = scrollPositions.value['shows'];
+    } else if (page === 'lists' && listsPageContainerRef.value && scrollPositions.value['lists'] !== undefined) {
+      listsPageContainerRef.value.scrollTop = scrollPositions.value['lists'];
+    } else if (page === 'list-view' && listViewPageContainerRef.value && scrollPositions.value['list-view'] !== undefined) {
+      listViewPageContainerRef.value.scrollTop = scrollPositions.value['list-view'];
+    } else if (page === 'discover' && discoverPageContainerRef.value && scrollPositions.value['discover'] !== undefined) {
+      discoverPageContainerRef.value.scrollTop = scrollPositions.value['discover'];
+    }
+  });
+};
+const navigateToPage = (newPage: string, resetSearch = false) => {
+  // Save current page scroll position
+  if (currentPage.value === 'home' && homePageContainerRef.value) {
+    scrollPositions.value['home'] = homePageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'profile' && profilePageContainerRef.value) {
+    scrollPositions.value['profile'] = profilePageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'shows' && showsPageContainerRef.value) {
+    scrollPositions.value['shows'] = showsPageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'lists' && listsPageContainerRef.value) {
+    scrollPositions.value['lists'] = listsPageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'list-view' && listViewPageContainerRef.value) {
+    scrollPositions.value['list-view'] = listViewPageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'discover' && discoverPageContainerRef.value) {
+    scrollPositions.value['discover'] = discoverPageContainerRef.value.scrollTop;
+  }
+  // Change page
+  currentPage.value = newPage;
+  if (resetSearch) {
+    searchQuery.value = '';
+  }
+  // Restore scroll for new page
+  restoreScrollPosition(newPage);
+};
 const goBack = () => {
   if (mediaHistory.value.length > 0) {
     const previousMedia = mediaHistory.value.pop();
@@ -307,8 +412,10 @@ const goBack = () => {
     fetchTrailer(previousMedia.id, previousMedia.media_type);
     fetchSimilarMedia(previousMedia.id, previousMedia.media_type);
   } else {
-    currentPage.value = 'home';
+    const previousPage = 'home';
+    currentPage.value = previousPage;
     mediaHistory.value = [];
+    restoreScrollPosition(previousPage);
   }
 };
 const openTrailer = () => {
@@ -321,6 +428,20 @@ const openTrailer = () => {
   }
 };
 const openMediaDetails = async (item: any, mediaType?: string) => {
+  // Save scroll position before leaving current page!
+  if (currentPage.value === 'home' && homePageContainerRef.value) {
+    scrollPositions.value['home'] = homePageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'profile' && profilePageContainerRef.value) {
+    scrollPositions.value['profile'] = profilePageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'shows' && showsPageContainerRef.value) {
+    scrollPositions.value['shows'] = showsPageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'lists' && listsPageContainerRef.value) {
+    scrollPositions.value['lists'] = listsPageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'list-view' && listViewPageContainerRef.value) {
+    scrollPositions.value['list-view'] = listViewPageContainerRef.value.scrollTop;
+  } else if (currentPage.value === 'discover' && discoverPageContainerRef.value) {
+    scrollPositions.value['discover'] = discoverPageContainerRef.value.scrollTop;
+  }
   // If item has synopsis_cached_json_data (from watchlist), parse it to get full TMDB data
   let fullMediaData = item;
   if (item.synopsis_cached_json_data) {
@@ -869,9 +990,16 @@ const removeMediaFromList = async (mediaId: number) => {
   }
 };
 const goBackToLists = () => {
+  // Save list-view scroll position
+  if (listViewPageContainerRef.value) {
+    scrollPositions.value['list-view'] = listViewPageContainerRef.value.scrollTop;
+  }
+  // Change page to lists and clear selected list
   currentPage.value = 'lists';
   selectedList.value = null;
   selectedListItems.value = [];
+  // Restore lists page scroll position
+  restoreScrollPosition('lists');
 };
 const loadUserProfile = async () => {
   try {
@@ -990,10 +1118,14 @@ const handleKeyDown = (event: KeyboardEvent) => {
         fetchTrailer(previousMedia.id, previousMedia.media_type);
         fetchSimilarMedia(previousMedia.id, previousMedia.media_type);
       } else {
-        currentPage.value = 'home';
+        const previousPage = 'home';
+        currentPage.value = previousPage;
+        restoreScrollPosition(previousPage);
       }
     } else if (currentPage.value !== 'home') {
-      currentPage.value = 'home';
+      const previousPage = 'home';
+      currentPage.value = previousPage;
+      restoreScrollPosition(previousPage);
     }
   }
   // --- Media details page shortcuts ---
@@ -1083,8 +1215,14 @@ onUnmounted(() => {
         </template>
       </div>
     </div> -->
+    <!-- KeepAlive to preserve page state and scroll -->
+    <KeepAlive>
     <!-- Home Page -->
-    <div v-if="currentPage === 'home'">
+    <div
+      v-if="currentPage === 'home'"
+      ref="homePageContainerRef"
+      class="h-screen overflow-y-auto pb-24"
+    >
       <!-- Tabs -->
       <div class="flex justify-around items-center mb-6 border-b-2 border-gray-200 pt-5">
         <button
@@ -1131,11 +1269,11 @@ onUnmounted(() => {
       <div v-else-if="activeTab === 'unwatched'">
         <!-- Unwatched section -->
         <div v-if="groupedUnwatchedMovies.length > 0" class="mb-8">
-          <div v-for="[year, movies] in groupedUnwatchedMovies" :key="year" class="mb-8">
-            <h3 class="text-lg font-bold mb-4 border-b-2 border-gray-200 pb-2">{{ year }}</h3>
+          <div v-for="bucket in groupedUnwatchedMovies" :key="bucket.label" class="mb-8">
+            <h3 class="text-lg font-bold mb-4 border-b-2 border-gray-200 pb-2">{{ bucket.label }}</h3>
             <div class="grid grid-cols-10 gap-2">
               <div
-                v-for="[media, watchlist] in movies"
+                v-for="[media, watchlist] in bucket.movies"
                 :key="media.media_id"
                 class="flex flex-col items-center cursor-pointer hover:opacity-80"
                 @click="openMediaDetails(media)"
@@ -1153,11 +1291,11 @@ onUnmounted(() => {
         <!-- Watched section -->
         <div v-if="groupedWatchedMovies.length > 0">
           <h2 class="text-xl font-bold mb-4 border-b-2 border-gray-200 pb-2 text-center">Watched</h2>
-          <div v-for="[year, movies] in groupedWatchedMovies" :key="year" class="mb-8">
-            <h3 class="text-lg font-bold mb-4 border-b-2 border-gray-200 pb-2">{{ year }}</h3>
+          <div v-for="bucket in groupedWatchedMovies" :key="bucket.label" class="mb-8">
+            <h3 class="text-lg font-bold mb-4 border-b-2 border-gray-200 pb-2">{{ bucket.label }}</h3>
             <div class="grid grid-cols-10 gap-2">
               <div
-                v-for="[media, watchlist] in movies"
+                v-for="[media, watchlist] in bucket.movies"
                 :key="media.media_id"
                 class="flex flex-col items-center cursor-pointer relative"
                 @click="openMediaDetails(media)"
@@ -1174,7 +1312,11 @@ onUnmounted(() => {
       </div>
     </div>
     <!-- Shows Page -->
-    <div v-else-if="currentPage === 'shows'">
+    <div
+      v-else-if="currentPage === 'shows'"
+      ref="showsPageContainerRef"
+      class="h-screen overflow-y-auto pb-24"
+    >
       <div class="flex border-b-2 border-gray-200 mb-6 pt-4">
         <button
           @click="activeShowsTab = 'watchlist'"
@@ -1291,7 +1433,11 @@ onUnmounted(() => {
       </div>
     </div>
     <!-- Discover Page (new) -->
-    <div v-else-if="currentPage === 'discover'">
+    <div
+      v-else-if="currentPage === 'discover'"
+      ref="discoverPageContainerRef"
+      class="h-screen overflow-y-auto pb-24"
+    >
       <div class="mb-6">
         <div class="flex gap-4 items-center pt-5">
           <div class="flex-1 relative">
@@ -1837,7 +1983,11 @@ onUnmounted(() => {
       </button>
     </div>
     <!-- Profile Page -->
-    <div v-else-if="currentPage === 'profile'" class="-mx-6">
+    <div
+      v-else-if="currentPage === 'profile'"
+      ref="profilePageContainerRef"
+      class="-mx-6 h-screen overflow-y-auto pb-24"
+    >
       <input
         ref="avatarFileInput"
         type="file"
@@ -2203,9 +2353,13 @@ onUnmounted(() => {
       </div>
     </div>
     <!-- Lists Page -->
-    <div v-else-if="currentPage === 'lists'" class="-mx-6">
+    <div
+      v-else-if="currentPage === 'lists'"
+      ref="listsPageContainerRef"
+      class="-mx-6 h-screen overflow-y-auto pb-24"
+    >
       <div class="px-6 pt-4 pb-4 border-b border-gray-200 flex items-center gap-4">
-        <button @click="currentPage = 'home'" class="p-2 hover:bg-gray-100 rounded-full">
+        <button @click="navigateToPage('home')" class="p-2 hover:bg-gray-100 rounded-full">
           <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
           </svg>
@@ -2261,7 +2415,11 @@ onUnmounted(() => {
       </div>
     </div>
     <!-- List View Page (when clicking a list from profile) -->
-    <div v-else-if="currentPage === 'list-view' && selectedList" class="-mx-6">
+    <div
+      v-else-if="currentPage === 'list-view' && selectedList"
+      ref="listViewPageContainerRef"
+      class="-mx-6 h-screen overflow-y-auto pb-24"
+    >
       <div class="px-6 pt-4 pb-4 border-b border-gray-200 flex items-center gap-4">
         <button @click="goBackToLists" class="p-2 hover:bg-gray-100 rounded-full">
           <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2371,7 +2529,7 @@ onUnmounted(() => {
     <!-- Fixed Bottom Navigation -->
     <div class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 flex justify-around items-center py-3 z-50">
       <button
-        @click="currentPage = 'home'"
+        @click="navigateToPage('home')"
         :class="currentPage === 'home' ? 'text-blue-600' : 'text-gray-400'"
         class="flex flex-col items-center gap-1 hover:text-gray-600 transition-colors"
       >
@@ -2384,7 +2542,7 @@ onUnmounted(() => {
         <span class="text-xs font-medium">Movies</span>
       </button>
       <button
-        @click="currentPage = 'shows'"
+        @click="navigateToPage('shows')"
         :class="currentPage === 'shows' ? 'text-blue-600' : 'text-gray-400'"
         class="flex flex-col items-center gap-1 hover:text-gray-600 transition-colors"
       >
@@ -2396,7 +2554,7 @@ onUnmounted(() => {
         <span class="text-xs font-medium">Shows</span>
       </button>
       <button
-        @click="currentPage = 'lists'"
+        @click="navigateToPage('lists')"
         :class="currentPage === 'lists' ? 'text-blue-600' : 'text-gray-400'"
         class="flex flex-col items-center gap-1 hover:text-gray-600 transition-colors"
       >
@@ -2409,7 +2567,7 @@ onUnmounted(() => {
         <span class="text-xs font-medium">Lists</span>
       </button>
       <button
-        @click="currentPage = 'discover'"
+        @click="navigateToPage('discover')"
         :class="currentPage === 'discover' ? 'text-blue-600' : 'text-gray-400'"
         class="flex flex-col items-center gap-1 hover:text-gray-600 transition-colors"
       >
@@ -2420,7 +2578,7 @@ onUnmounted(() => {
         <span class="text-xs font-medium">Discover</span>
       </button>
       <button
-        @click="currentPage = 'profile'"
+        @click="navigateToPage('profile')"
         :class="currentPage === 'profile' ? 'text-blue-600' : 'text-gray-400'"
         class="flex flex-col items-center gap-1 hover:text-gray-600 transition-colors"
       >
@@ -2431,6 +2589,7 @@ onUnmounted(() => {
         <span class="text-xs font-medium">Profile</span>
       </button>
       </div>
+    </KeepAlive>
     </template>
     <!-- Import Backup Confirmation Modal -->
     <div v-if="showImportConfirm" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
