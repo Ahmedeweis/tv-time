@@ -355,113 +355,89 @@ async fn get_tv_season_episodes(
 // Tauri command: Get upcoming episodes for all TV shows in watchlist
 #[tauri::command]
 async fn get_upcoming_episodes(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let shows = {
+    let mut all_upcoming = Vec::new();
+    let today = chrono::Utc::now().date_naive();
+
+    {
+        // First, get upcoming episodes from the local database
         let conn = state.db.lock().await;
-        // Get all TV shows from watchlist
         let mut stmt = conn
-            .prepare("SELECT media_id, title, poster_path FROM media_cache WHERE media_type = 'tv'")
+            .prepare(
+                "
+                SELECT
+                    mc.media_id,
+                    mc.title,
+                    mc.poster_path,
+                    e.season_number,
+                    e.episode_number,
+                    e.episode_name,
+                    e.air_date,
+                    e.still_path
+                FROM episodes e
+                JOIN media_cache mc ON e.media_id = mc.media_id
+                JOIN user_watchlist uw ON mc.media_id = uw.media_id
+                WHERE mc.media_type = 'tv'
+            ",
+            )
             .map_err(|e| e.to_string())?;
-        let shows = stmt
+
+        let episodes = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
-        let mut result = Vec::new();
-        for show_result in shows {
-            if let Ok(show) = show_result {
-                result.push(show);
-            }
-        }
-        result
-    };
-    let mut all_upcoming = Vec::new();
-    let today = chrono::Utc::now().date_naive();
-    for (media_id, title, poster_path) in shows {
-        // Fetch fresh data from TMDB
-        let client = reqwest::Client::new();
-        let url = format!("{}/tv/{}?api_key={}", TMDB_BASE_URL, media_id, TMDB_API_KEY);
-        match client.get(&url).send().await {
-            Ok(response) => {
-                match response.json::<serde_json::Value>().await {
-                    Ok(show_data) => {
-                        if let Some(seasons) = show_data.get("seasons").and_then(|s| s.as_array()) {
-                            for season in seasons {
-                                if let Some(season_number) =
-                                    season.get("season_number").and_then(|s| s.as_i64())
-                                {
-                                    if season_number > 0 {
-                                        // Skip special seasons
-                                        // Fetch episodes for this season
-                                        let season_url = format!(
-                                            "{}/tv/{}/season/{}?api_key={}",
-                                            TMDB_BASE_URL, media_id, season_number, TMDB_API_KEY
-                                        );
-                                        match client.get(&season_url).send().await {
-                                            Ok(season_response) => {
-                                                match season_response
-                                                    .json::<serde_json::Value>()
-                                                    .await
-                                                {
-                                                    Ok(season_data) => {
-                                                        if let Some(episodes) = season_data
-                                                            .get("episodes")
-                                                            .and_then(|e| e.as_array())
-                                                        {
-                                                            for episode in episodes {
-                                                                if let Some(air_date_str) = episode
-                                                                    .get("air_date")
-                                                                    .and_then(|d| d.as_str())
-                                                                {
-                                                                    if let Ok(air_date) = chrono::NaiveDate::parse_from_str(air_date_str, "%Y-%m-%d") {
-                                                                        if air_date >= today {
-                                                                            let episode_number = episode.get("episode_number").and_then(|e| e.as_i64()).unwrap_or(0);
-                                                                            let episode_name = episode.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                                                                            let still_path = episode.get("still_path").and_then(|p| p.as_str()).map(|s| s.to_string());
-                                                                            all_upcoming.push(serde_json::json!({
-                                                                                "media_id": media_id,
-                                                                                "title": title,
-                                                                                "poster_path": poster_path,
-                                                                                "season_number": season_number,
-                                                                                "episode_number": episode_number,
-                                                                                "episode_name": episode_name,
-                                                                                "air_date": air_date_str,
-                                                                                "still_path": still_path,
-                                                                                "days_until": (air_date - today).num_days()
-                                                                            }));
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(_) => {} // Skip if season data fails
-                                                }
-                                            }
-                                            Err(_) => {} // Skip if season request fails
-                                        }
-                                    }
-                                }
-                            }
+
+        for episode_result in episodes {
+            if let Ok((
+                media_id,
+                title,
+                poster_path,
+                season_number,
+                episode_number,
+                episode_name,
+                air_date_str,
+                still_path,
+            )) = episode_result
+            {
+                if let Some(air_date_str) = air_date_str {
+                    if let Ok(air_date) =
+                        chrono::NaiveDate::parse_from_str(&air_date_str, "%Y-%m-%d")
+                    {
+                        if air_date >= today {
+                            all_upcoming.push(serde_json::json!({
+                                "media_id": media_id,
+                                "title": title,
+                                "poster_path": poster_path,
+                                "season_number": season_number,
+                                "episode_number": episode_number,
+                                "episode_name": episode_name,
+                                "air_date": air_date_str,
+                                "still_path": still_path,
+                                "days_until": (air_date - today).num_days()
+                            }));
                         }
                     }
-                    Err(_) => {} // Skip if show data fails
                 }
             }
-            Err(_) => {} // Skip if show request fails
         }
-        // Rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
+
     // Sort by air date ascending
     all_upcoming.sort_by(|a, b| {
         let a_date = a.get("air_date").and_then(|d| d.as_str()).unwrap_or("");
         let b_date = b.get("air_date").and_then(|d| d.as_str()).unwrap_or("");
         a_date.cmp(b_date)
     });
+
     Ok(serde_json::json!({ "upcoming_episodes": all_upcoming }))
 }
 // Tauri command: Get next episode to watch for each TV show
@@ -469,7 +445,10 @@ async fn get_upcoming_episodes(state: State<'_, AppState>) -> Result<serde_json:
 async fn get_next_episodes_to_watch(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let (shows_with_last_watched, shows_havent_started) = {
+    let mut next_episodes = Vec::new();
+    let mut shows_havent_started = Vec::new();
+
+    {
         let conn = state.db.lock().await;
         // Get all TV shows from watchlist
         let mut stmt = conn
@@ -491,8 +470,6 @@ async fn get_next_episodes_to_watch(
                 ))
             })
             .map_err(|e| e.to_string())?;
-        let mut result_watched = Vec::new();
-        let mut result_havent_started = Vec::new();
         for show_result in shows {
             if let Ok((media_id, title, poster_path)) = show_result {
                 // Get the last watched episode for this show
@@ -513,147 +490,109 @@ async fn get_next_episodes_to_watch(
                     })
                     .optional()
                     .map_err(|e| e.to_string())?;
-                if let Some(last_watched) = last_watched {
-                    result_watched.push((media_id, title, poster_path, Some(last_watched)));
-                } else {
-                    result_havent_started.push((media_id, title, poster_path));
-                }
-            }
-        }
-        (result_watched, result_havent_started)
-    };
-    let mut next_episodes = Vec::new();
-    for (media_id, title, poster_path, last_watched) in shows_with_last_watched {
-        // Fetch fresh data from TMDB
-        let client = reqwest::Client::new();
-        let url = format!("{}/tv/{}?api_key={}", TMDB_BASE_URL, media_id, TMDB_API_KEY);
-        match client.get(&url).send().await {
-            Ok(response) => {
-                match response.json::<serde_json::Value>().await {
-                    Ok(show_data) => {
-                        if let Some(seasons) = show_data.get("seasons").and_then(|s| s.as_array()) {
-                            let mut found_next = false;
-                            for season in seasons {
-                                if found_next {
-                                    break;
-                                }
-                                if let Some(season_number) =
-                                    season.get("season_number").and_then(|s| s.as_i64())
-                                {
-                                    if season_number > 0 {
-                                        // Fetch episodes for this season
-                                        let season_url = format!(
-                                            "{}/tv/{}/season/{}?api_key={}",
-                                            TMDB_BASE_URL, media_id, season_number, TMDB_API_KEY
-                                        );
-                                        match client.get(&season_url).send().await {
-                                            Ok(season_response) => {
-                                                match season_response
-                                                    .json::<serde_json::Value>()
-                                                    .await
-                                                {
-                                                    Ok(season_data) => {
-                                                        if let Some(episodes) = season_data
-                                                            .get("episodes")
-                                                            .and_then(|e| e.as_array())
-                                                        {
-                                                            for episode in episodes {
-                                                                if let Some(ep_number) = episode
-                                                                    .get("episode_number")
-                                                                    .and_then(|e| e.as_i64())
-                                                                {
-                                                                    match last_watched {
-                                                                        Some((
-                                                                            last_season,
-                                                                            last_episode,
-                                                                        )) => {
-                                                                            // Find the next episode after the last watched one
-                                                                            if season_number
-                                                                                == last_season
-                                                                                && ep_number
-                                                                                    > last_episode
-                                                                            {
-                                                                                let episode_name = episode.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                                                                                let still_path = episode.get("still_path").and_then(|p| p.as_str()).map(|s| s.to_string());
-                                                                                let air_date = episode.get("air_date").and_then(|d| d.as_str()).map(|s| s.to_string());
-                                                                                next_episodes.push(serde_json::json!({
-                                                                                    "media_id": media_id,
-                                                                                    "title": title,
-                                                                                    "poster_path": poster_path,
-                                                                                    "season_number": season_number,
-                                                                                    "episode_number": ep_number,
-                                                                                    "episode_name": episode_name,
-                                                                                    "still_path": still_path,
-                                                                                    "air_date": air_date
-                                                                                }));
-                                                                                found_next = true;
-                                                                                break;
-                                                                            } else if season_number
-                                                                                > last_season
-                                                                            {
-                                                                                // First episode of next season
-                                                                                let episode_name = episode.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                                                                                let still_path = episode.get("still_path").and_then(|p| p.as_str()).map(|s| s.to_string());
-                                                                                let air_date = episode.get("air_date").and_then(|d| d.as_str()).map(|s| s.to_string());
-                                                                                next_episodes.push(serde_json::json!({
-                                                                                    "media_id": media_id,
-                                                                                    "title": title,
-                                                                                    "poster_path": poster_path,
-                                                                                    "season_number": season_number,
-                                                                                    "episode_number": ep_number,
-                                                                                    "episode_name": episode_name,
-                                                                                    "still_path": still_path,
-                                                                                    "air_date": air_date
-                                                                                }));
-                                                                                found_next = true;
-                                                                                break;
-                                                                            }
-                                                                        }
-                                                                        None => {
-                                                                            // No episodes watched yet, show first episode of first season
-                                                                            if season_number == 1
-                                                                                && ep_number == 1
-                                                                            {
-                                                                                let episode_name = episode.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                                                                                let still_path = episode.get("still_path").and_then(|p| p.as_str()).map(|s| s.to_string());
-                                                                                let air_date = episode.get("air_date").and_then(|d| d.as_str()).map(|s| s.to_string());
-                                                                                next_episodes.push(serde_json::json!({
-                                                                                    "media_id": media_id,
-                                                                                    "title": title,
-                                                                                    "poster_path": poster_path,
-                                                                                    "season_number": season_number,
-                                                                                    "episode_number": ep_number,
-                                                                                    "episode_name": episode_name,
-                                                                                    "still_path": still_path,
-                                                                                    "air_date": air_date
-                                                                                }));
-                                                                                found_next = true;
-                                                                                break;
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(_) => {} // Skip if season data fails
-                                                }
-                                            }
-                                            Err(_) => {} // Skip if season request fails
-                                        }
-                                    }
-                                }
-                            }
+
+                if let Some((last_season, last_episode)) = last_watched {
+                    // Find next episode in local DB
+                    // let mut _found_next = false; // unused for now
+
+                    // First check same season
+                    let mut same_season_stmt = conn
+                        .prepare(
+                            "
+                            SELECT season_number, episode_number, episode_name, air_date, still_path
+                            FROM episodes
+                            WHERE media_id = ?1 AND season_number = ?2 AND episode_number > ?3
+                            ORDER BY episode_number ASC
+                            LIMIT 1
+                            ",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let same_season = same_season_stmt
+                        .query_row(params![media_id, last_season, last_episode], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                            ))
+                        })
+                        .optional()
+                        .map_err(|e| e.to_string())?;
+
+                    if let Some((
+                        season_number,
+                        episode_number,
+                        episode_name,
+                        air_date,
+                        still_path,
+                    )) = same_season
+                    {
+                        next_episodes.push(serde_json::json!({
+                            "media_id": media_id,
+                            "title": title,
+                            "poster_path": poster_path,
+                            "season_number": season_number,
+                            "episode_number": episode_number,
+                            "episode_name": episode_name,
+                            "still_path": still_path,
+                            "air_date": air_date
+                        }));
+                        // found_next = true; // unused
+                    } else {
+                        // Check next seasons
+                        let mut next_season_stmt = conn
+                            .prepare(
+                                "
+                                SELECT season_number, episode_number, episode_name, air_date, still_path
+                                FROM episodes
+                                WHERE media_id = ?1 AND season_number > ?2
+                                ORDER BY season_number ASC, episode_number ASC
+                                LIMIT 1
+                                "
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let next_season = next_season_stmt
+                            .query_row(params![media_id, last_season], |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, Option<String>>(3)?,
+                                    row.get::<_, Option<String>>(4)?,
+                                ))
+                            })
+                            .optional()
+                            .map_err(|e| e.to_string())?;
+                        if let Some((
+                            season_number,
+                            episode_number,
+                            episode_name,
+                            air_date,
+                            still_path,
+                        )) = next_season
+                        {
+                            next_episodes.push(serde_json::json!({
+                                "media_id": media_id,
+                                "title": title,
+                                "poster_path": poster_path,
+                                "season_number": season_number,
+                                "episode_number": episode_number,
+                                "episode_name": episode_name,
+                                "still_path": still_path,
+                                "air_date": air_date
+                            }));
+                            // found_next = true; // unused
                         }
                     }
-                    Err(_) => {} // Skip if show data fails
+                } else {
+                    // Haven't started show
+                    shows_havent_started.push((media_id, title, poster_path));
                 }
             }
-            Err(_) => {} // Skip if show request fails
         }
-        // Rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
+
     // Add haven't started shows to the result
     for (media_id, title, poster_path) in shows_havent_started {
         next_episodes.push(serde_json::json!({
@@ -668,7 +607,68 @@ async fn get_next_episodes_to_watch(
             "is_havent_started": true
         }));
     }
+
     Ok(serde_json::json!({ "next_episodes": next_episodes }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Stats {
+    total_watchlist_movies: i64,
+    total_watchlist_shows: i64,
+    total_watched_movies: i64,
+    total_watched_episodes: i64,
+}
+
+#[tauri::command]
+async fn get_stats(state: State<'_, AppState>) -> Result<Stats, String> {
+    let conn = state.db.lock().await;
+
+    // Total movies in watchlist (media_type = 'movie')
+    let total_watchlist_movies: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media_cache mc
+             JOIN user_watchlist uw ON mc.media_id = uw.media_id
+             WHERE mc.media_type = 'movie'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Total shows in watchlist (media_type = 'tv')
+    let total_watchlist_shows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media_cache mc
+             JOIN user_watchlist uw ON mc.media_id = uw.media_id
+             WHERE mc.media_type = 'tv'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Total watched movies
+    let total_watched_movies: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media_cache mc
+             JOIN user_watchlist uw ON mc.media_id = uw.media_id
+             WHERE mc.media_type = 'movie' AND uw.status = 'watched'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Total watched episodes (direct count from watched_episodes)
+    let total_watched_episodes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM watched_episodes", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(Stats {
+        total_watchlist_movies,
+        total_watchlist_shows,
+        total_watched_movies,
+        total_watched_episodes,
+    })
 }
 // Tauri command: Get watched episodes for a TV show
 #[tauri::command]
@@ -1831,14 +1831,17 @@ async fn export_database(state: State<'_, AppState>) -> Result<String, String> {
     if let Some(path) = file_path {
         let conn = state.db.lock().await;
         let path_str = path.to_string_lossy();
-        
+
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
 
-        conn.execute(&format!("VACUUM INTO '{}'", path_str.replace("'", "''")), [])
-            .map_err(|e| format!("Failed to export database: {}", e))?;
-        
+        conn.execute(
+            &format!("VACUUM INTO '{}'", path_str.replace("'", "''")),
+            [],
+        )
+        .map_err(|e| format!("Failed to export database: {}", e))?;
+
         Ok("Database exported successfully".to_string())
     } else {
         Err("Export cancelled by user".to_string())
@@ -1872,8 +1875,8 @@ async fn import_database(state: State<'_, AppState>) -> Result<String, String> {
             .map_err(|e| format!("Failed to restore database file: {}", e))?;
 
         // Reopen the connection to the database file
-        let new_conn = Connection::open(&db_path)
-            .map_err(|e| format!("Failed to reopen database: {}", e))?;
+        let new_conn =
+            Connection::open(&db_path).map_err(|e| format!("Failed to reopen database: {}", e))?;
 
         // Replace the in-memory connection with the restored database connection
         *conn = new_conn;
@@ -1921,6 +1924,7 @@ pub fn run() {
             toggle_episode_watched,
             get_upcoming_episodes,
             get_next_episodes_to_watch,
+            get_stats,
             // New TMDB account commands
             get_tmdb_request_token,
             open_tmdb_auth_url,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
 import { useRoute } from 'vue-router';
 import moviesIcon from './assets/movies.png';
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
@@ -27,7 +27,7 @@ const isAuthenticating = ref(false);
 const pendingRequestToken = ref<string | null>(null);
 // Page state for bottom nav
 const currentPage = ref('home');
-const activeTab = ref('upcoming');
+const activeTab = ref('unwatched');
 const route = useRoute();
 const selectedMedia = ref<any>(null);
 interface MediaCache {
@@ -95,6 +95,12 @@ interface ListItem {
   release_date: string | null;
   added_at: string;
 }
+interface StatsData {
+  total_watchlist_movies: number;
+  total_watchlist_shows: number;
+  total_watched_movies: number;
+  total_watched_episodes: number;
+}
 const userLists = ref<UserList[]>([]);
 const selectedList = ref<UserList | null>(null);
 const selectedListItems = ref<ListItem[]>([]);
@@ -112,6 +118,15 @@ const renameListName = ref('');
 const listToRename = ref<UserList | null>(null);
 const listToDelete = ref<UserList | null>(null);
 const currentListPage = ref<'lists' | 'view'>('lists');
+const stats = ref<StatsData | null>(null);
+const loadStats = async () => {
+  try {
+    const statsData = await invoke<StatsData>('get_stats');
+    stats.value = statsData;
+  } catch (error) {
+    console.error('Load stats error:', error);
+  }
+};
 const favoriteShows = computed(() => favoriteItems.value.filter(item => item.media_type === 'tv'));
 const favoriteMovies = computed(() => favoriteItems.value.filter(item => item.media_type === 'movie'));
 const watchlistMediaIds = computed(() => {
@@ -122,6 +137,37 @@ const watchlistMediaIds = computed(() => {
 });
 const watchedReleased = computed(() => releasedWatchlist.value.filter(m => m[1].status === 'watched' && m[0].media_type !== 'tv'));
 const unwatchedReleased = computed(() => releasedWatchlist.value.filter(m => m[1].status === 'to_watch' && m[0].media_type !== 'tv'));
+// Helper to sort and group movies by release year
+const groupMoviesByYear = (movies: [MediaCache, UserWatchlistItem][]) => {
+  // Sort movies in descending order of release date first
+  const sorted = [...movies].sort((a, b) => {
+    const dateA = a[0].release_date ? new Date(a[0].release_date).getTime() : 0;
+    const dateB = b[0].release_date ? new Date(b[0].release_date).getTime() : 0;
+    return dateB - dateA; // Newest first
+  });
+  // Group by year
+  const grouped = new Map<string, [MediaCache, UserWatchlistItem][]>();
+  for (const movie of sorted) {
+    const year = movie[0].release_date
+      ? new Date(movie[0].release_date).getFullYear().toString()
+      : 'Unknown';
+    if (!grouped.has(year)) {
+      grouped.set(year, []);
+    }
+    grouped.get(year)!.push(movie);
+  }
+  // Sort years in descending order (newest first)
+  const sortedYears = Array.from(grouped.keys()).sort((a, b) => {
+    if (a === 'Unknown') return 1;
+    if (b === 'Unknown') return -1;
+    return parseInt(b) - parseInt(a);
+  });
+  // Convert to array of [year, movies] for easy iteration in template
+  return sortedYears.map(year => [year, grouped.get(year)!] as [string, [MediaCache, UserWatchlistItem][]]);
+};
+// Grouped and sorted movies for UI
+const groupedWatchedMovies = computed(() => groupMoviesByYear(watchedReleased.value));
+const groupedUnwatchedMovies = computed(() => groupMoviesByYear(unwatchedReleased.value));
 const showsWatchNext = computed(() => {
   return releasedWatchlist.value.filter(m => m[0].media_type === 'tv' && (m[1].watched_episode_count || 0) > 0);
 });
@@ -361,6 +407,7 @@ const toggleEpisode = async (mediaId: number, seasonNumber: number, episodeNumbe
     // Reload dashboard to update counts
     await loadDashboard();
     await loadNextEpisodesToWatch();
+    await loadStats();
   } catch (e) {
     console.error('Error toggling episode:', e);
   }
@@ -395,6 +442,7 @@ const markSeasonAsWatched = async (mediaId: number, seasonNumber: number) => {
       }
       await loadDashboard();
       await loadNextEpisodesToWatch();
+      await loadStats();
     }
   } catch (e) {
     console.error('Error marking season as watched:', e);
@@ -413,6 +461,7 @@ const unmarkSeasonAsWatched = async (mediaId: number, seasonNumber: number) => {
       }
       await loadDashboard();
       await loadNextEpisodesToWatch();
+      await loadStats();
     }
   } catch (e) {
     console.error('Error unmarking season as watched:', e);
@@ -487,19 +536,16 @@ const handleImportBackup = async () => {
   try {
     await invoke('import_database');
     backupStatus.value = { type: 'success', message: 'Database backup imported successfully! Reloading data...' };
-    
     // Reset all reactive state on the frontend too!
     searchResults.value = [];
     selectedMedia.value = null;
     watchedEpisodes.value = new Set();
-    
     // Reload everything!
     await loadDashboard();
     await loadNextEpisodesToWatch();
     await loadUserProfile();
     await loadFavorites();
     await loadLists();
-    
     setTimeout(() => {
       if (backupStatus.value.type === 'success') {
         backupStatus.value = { type: '', message: '' };
@@ -538,6 +584,10 @@ const addToWatchlist = async (mediaId: number, mediaType: string) => {
       await toggleTmdbWatchlist(mediaId, mediaType, true);
     }
     await loadDashboard();
+    if (mediaType === 'tv') {
+      await loadNextEpisodesToWatch();
+    }
+    await loadStats();
   } catch (error) {
     console.error('Add to watchlist error:', error);
   }
@@ -556,6 +606,10 @@ const removeFromWatchlist = async (mediaId: number, mediaType: string) => {
       await loadFavorites();
     }
     await loadDashboard();
+    if (mediaType === 'tv') {
+      await loadNextEpisodesToWatch();
+    }
+    await loadStats();
   } catch (error) {
     console.error('Remove from watchlist error:', error);
   }
@@ -564,6 +618,7 @@ const markAsWatched = async (mediaId: number) => {
   try {
     await invoke('mark_as_watched', { mediaId });
     await loadDashboard();
+    await loadStats();
   } catch (error) {
     console.error('Mark as watched error:', error);
   }
@@ -572,6 +627,7 @@ const markAsToWatch = async (mediaId: number) => {
   try {
     await invoke('mark_as_to_watch', { mediaId });
     await loadDashboard();
+    await loadStats();
   } catch (error) {
     console.error('Mark as to watch error:', error);
   }
@@ -888,6 +944,80 @@ const onCoverSelected = async (event: Event) => {
     input.value = '';
   }
 };
+const handleKeyDown = (event: KeyboardEvent) => {
+  // Input guard: don't trigger shortcuts if focused on input/textarea
+  const target = event.target as HTMLElement;
+  const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
+  // --- Escape / Backspace for back navigation ---
+  if (event.key === 'Escape' || (event.key === 'Backspace' && !isInput)) {
+    if (showTrailerModal.value) {
+      showTrailerModal.value = false;
+      return;
+    }
+    if (showCreateListModal.value) {
+      showCreateListModal.value = false;
+      return;
+    }
+    if (showRenameListModal.value) {
+      showRenameListModal.value = false;
+      return;
+    }
+    if (showDeleteListConfirm.value) {
+      showDeleteListConfirm.value = false;
+      return;
+    }
+    if (showAddToListModal.value) {
+      showAddToListModal.value = false;
+      return;
+    }
+    if (showImportConfirm.value) {
+      showImportConfirm.value = false;
+      return;
+    }
+    if (showResetConfirm.value) {
+      showResetConfirm.value = false;
+      return;
+    }
+    if (showUnwatchConfirm.value) {
+      showUnwatchConfirm.value = false;
+      return;
+    }
+    // If no modals open, go back
+    if (mediaHistory.value.length > 0) {
+      const previousMedia = mediaHistory.value.pop();
+      selectedMedia.value = previousMedia;
+      if (previousMedia) {
+        fetchTrailer(previousMedia.id, previousMedia.media_type);
+        fetchSimilarMedia(previousMedia.id, previousMedia.media_type);
+      } else {
+        currentPage.value = 'home';
+      }
+    } else if (currentPage.value !== 'home') {
+      currentPage.value = 'home';
+    }
+  }
+  // --- Media details page shortcuts ---
+  if (currentPage.value === 'details' && selectedMedia.value && !isInput) {
+    const mediaId = selectedMedia.value.id;
+    const mediaType = selectedMedia.value.media_type;
+    // Enter: Toggle watchlist
+    if (event.key === 'Enter') {
+      if (watchlistMediaIds.value.has(mediaId)) {
+        removeFromWatchlist(mediaId, mediaType);
+      } else {
+        addToWatchlist(mediaId, mediaType);
+      }
+    }
+    // Delete/Shift+Delete: Remove from watchlist or favorites
+    if (event.key === 'Delete') {
+      if (watchlistMediaIds.value.has(mediaId)) {
+        removeFromWatchlist(mediaId, mediaType);
+      } else if (favoriteMediaIds.value.has(mediaId)) {
+        toggleFavorite(mediaId, mediaType);
+      }
+    }
+  }
+};
 onMounted(async () => {
   await checkTmdbSession();
   await loadDashboard();
@@ -896,11 +1026,18 @@ onMounted(async () => {
   await loadUserProfile();
   await loadFavorites();
   await loadLists();
+  await loadStats();
   try {
     await invoke('get_upcoming_movies', { page: 1 });
   } catch (error) {
     console.error('Get upcoming movies error:', error);
   }
+  // Add keyboard event listener
+  window.addEventListener('keydown', handleKeyDown);
+});
+onUnmounted(() => {
+  // Cleanup keyboard event listener
+  window.removeEventListener('keydown', handleKeyDown);
 });
 </script>
 <template>
@@ -967,7 +1104,7 @@ onMounted(async () => {
       </div>
       <!-- Upcoming Tab Content -->
       <div v-if="activeTab === 'upcoming'">
-        <div v-if="upcomingWatchlist.length > 0" class="grid grid-cols-6 gap-2">
+        <div v-if="upcomingWatchlist.length > 0" class="grid grid-cols-10 gap-2">
           <div
             v-for="[media, _] in upcomingWatchlist"
             :key="media.media_id"
@@ -993,38 +1130,44 @@ onMounted(async () => {
       <!-- Unwatched Tab Content -->
       <div v-else-if="activeTab === 'unwatched'">
         <!-- Unwatched section -->
-        <div v-if="unwatchedReleased.length > 0" class="mb-8">
-          <div class="grid grid-cols-6 gap-2">
-            <div
-              v-for="[media, watchlist] in unwatchedReleased"
-              :key="media.media_id"
-              class="flex flex-col items-center cursor-pointer hover:opacity-80"
-              @click="openMediaDetails(media)"
-            >
-              <img
-                :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
-                :alt="media.title"
-                class="w-full aspect-[2/3] object-cover rounded-lg"
-              />
+        <div v-if="groupedUnwatchedMovies.length > 0" class="mb-8">
+          <div v-for="[year, movies] in groupedUnwatchedMovies" :key="year" class="mb-8">
+            <h3 class="text-lg font-bold mb-4 border-b-2 border-gray-200 pb-2">{{ year }}</h3>
+            <div class="grid grid-cols-10 gap-2">
+              <div
+                v-for="[media, watchlist] in movies"
+                :key="media.media_id"
+                class="flex flex-col items-center cursor-pointer hover:opacity-80"
+                @click="openMediaDetails(media)"
+              >
+                <img
+                  :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
+                  :alt="media.title"
+                  class="w-full aspect-[2/3] object-cover rounded-lg"
+                />
+              </div>
             </div>
           </div>
         </div>
-        <p v-else-if="watchedReleased.length === 0" class="text-gray-400 text-center mb-8">No unwatched items yet.</p>
+        <p v-else-if="groupedWatchedMovies.length === 0" class="text-gray-400 text-center mb-8">No unwatched items yet.</p>
         <!-- Watched section -->
-        <div v-if="watchedReleased.length > 0">
+        <div v-if="groupedWatchedMovies.length > 0">
           <h2 class="text-xl font-bold mb-4 border-b-2 border-gray-200 pb-2 text-center">Watched</h2>
-          <div class="grid grid-cols-6 gap-2">
-            <div
-              v-for="[media, watchlist] in watchedReleased"
-              :key="media.media_id"
-              class="flex flex-col items-center cursor-pointer  relative"
-              @click="openMediaDetails(media)"
-            >
-              <img
-                :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
-                :alt="media.title"
-                class="w-full aspect-[2/3] object-cover rounded-lg "
-              />
+          <div v-for="[year, movies] in groupedWatchedMovies" :key="year" class="mb-8">
+            <h3 class="text-lg font-bold mb-4 border-b-2 border-gray-200 pb-2">{{ year }}</h3>
+            <div class="grid grid-cols-10 gap-2">
+              <div
+                v-for="[media, watchlist] in movies"
+                :key="media.media_id"
+                class="flex flex-col items-center cursor-pointer relative"
+                @click="openMediaDetails(media)"
+              >
+                <img
+                  :src="media.poster_path ? `https://image.tmdb.org/t/p/w185${media.poster_path}` : 'https://via.placeholder.com/200x300?text=No+Image'"
+                  :alt="media.title"
+                  class="w-full aspect-[2/3] object-cover rounded-lg"
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -1052,7 +1195,7 @@ onMounted(async () => {
         <!-- Watch Next section -->
         <div class="mb-8 text-center">
           <h2 class="text-sm font-bold bg-gray-400 text-white rounded-full px-4 py-1 inline-block mb-4 mx-auto block w-max">WATCH LIST</h2>
-          <div v-if="nextEpisodesToWatch.filter(ep => !ep.is_havent_started).length > 0" class="grid grid-cols-6 gap-2">
+          <div v-if="nextEpisodesToWatch.filter(ep => !ep.is_havent_started).length > 0" class="grid grid-cols-10 gap-2">
             <div
               v-for="ep in nextEpisodesToWatch.filter(ep => !ep.is_havent_started)"
               :key="`${ep.media_id}-${ep.season_number}-${ep.episode_number}`"
@@ -1071,7 +1214,7 @@ onMounted(async () => {
         <!-- Haven't Started section -->
         <div class="text-center">
           <h2 class="text-sm font-bold bg-gray-400 text-white rounded-full px-4 py-1 inline-block mb-4 mx-auto block w-max">HAVEN'T STARTED</h2>
-          <div v-if="nextEpisodesToWatch.filter(ep => ep.is_havent_started).length > 0" class="grid grid-cols-6 gap-2">
+          <div v-if="nextEpisodesToWatch.filter(ep => ep.is_havent_started).length > 0" class="grid grid-cols-10 gap-2">
             <div
               v-for="ep in nextEpisodesToWatch.filter(ep => ep.is_havent_started)"
               :key="ep.media_id"
@@ -1090,10 +1233,10 @@ onMounted(async () => {
         <!-- Done section -->
         <div class="mt-8 text-center">
           <h2 class="text-sm font-bold bg-green-500 text-white rounded-full px-4 py-1 inline-block mb-4 mx-auto block w-max">DONE</h2>
-          <div v-if="isLoadingNextEpisodes" class="grid grid-cols-6 gap-2">
+          <div v-if="isLoadingNextEpisodes" class="grid grid-cols-10 gap-2">
             <div v-for="n in 6" :key="n" class="aspect-[2/3] rounded-lg bg-gray-200 animate-pulse"></div>
           </div>
-          <div v-else-if="showsDone.length > 0" class="grid grid-cols-6 gap-2">
+          <div v-else-if="showsDone.length > 0" class="grid grid-cols-10 gap-2">
             <div
               v-for="[media] in showsDone"
               :key="media.media_id"
@@ -1121,7 +1264,7 @@ onMounted(async () => {
         </div>
       </div>
       <div v-else-if="activeShowsTab === 'upcoming'">
-        <div v-if="upcomingEpisodes.length > 0" class="grid grid-cols-6 gap-2">
+        <div v-if="upcomingEpisodes.length > 0" class="grid grid-cols-10 gap-2">
           <div
             v-for="ep in upcomingEpisodes"
             :key="`${ep.media_id}-${ep.season_number}-${ep.episode_number}`"
@@ -1818,33 +1961,26 @@ onMounted(async () => {
         <section>
           <div class="flex items-center justify-between mb-3">
             <h2 class="text-xl font-bold">Stats</h2>
-            <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
-            </svg>
           </div>
           <div class="grid grid-cols-2 gap-3">
             <div class="border border-gray-200 rounded-lg p-3 bg-white">
               <div class="flex items-center gap-2 mb-3 text-sm text-gray-600">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <rect x="2" y="7" width="20" height="15" rx="2" stroke-width="2"/>
+                </svg>
+                <span>Movies in Watchlist</span>
+              </div>
+              <p class="text-3xl font-bold">{{ stats?.total_watchlist_movies || 0 }}</p>
+            </div>
+            <div class="border border-gray-200 rounded-lg p-3 bg-white">
+              <div class="flex items-center gap-2 mb-3 text-sm text-gray-600">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <rect x="2" y="7" width="20" height="15" rx="2" stroke-width="2"/>
                   <path d="M17 7V5a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v2" stroke-width="2"/>
                 </svg>
-                <span>TV time</span>
+                <span>Shows in Watchlist</span>
               </div>
-              <div class="flex justify-between text-center">
-                <div>
-                  <p class="text-lg font-bold leading-none">0</p>
-                  <p class="text-[10px] text-gray-400 uppercase mt-1">Months</p>
-                </div>
-                <div>
-                  <p class="text-lg font-bold leading-none">1</p>
-                  <p class="text-[10px] text-gray-400 uppercase mt-1">Day</p>
-                </div>
-                <div>
-                  <p class="text-lg font-bold leading-none">17</p>
-                  <p class="text-[10px] text-gray-400 uppercase mt-1">Hours</p>
-                </div>
-              </div>
+              <p class="text-3xl font-bold">{{ stats?.total_watchlist_shows || 0 }}</p>
             </div>
             <div class="border border-gray-200 rounded-lg p-3 bg-white">
               <div class="flex items-center gap-2 mb-3 text-sm text-gray-600">
@@ -1853,13 +1989,23 @@ onMounted(async () => {
                   <path d="M16 2v4M8 2v4M3 10h18" stroke-width="2"/>
                   <path d="M9 14l2 2 4-4" stroke-width="2"/>
                 </svg>
-                <span class="truncate">Episodes watched</span>
+                <span class="truncate">Movies Watched</span>
               </div>
-              <p class="text-3xl font-bold">{{ profileEpisodesWatched }}</p>
+              <p class="text-3xl font-bold">{{ stats?.total_watched_movies || 0 }}</p>
+            </div>
+            <div class="border border-gray-200 rounded-lg p-3 bg-white">
+              <div class="flex items-center gap-2 mb-3 text-sm text-gray-600">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <rect x="3" y="4" width="18" height="18" rx="2" stroke-width="2"/>
+                  <path d="M16 2v4M8 2v4M3 10h18" stroke-width="2"/>
+                  <path d="M9 14l2 2 4-4" stroke-width="2"/>
+                </svg>
+                <span class="truncate">Episodes Watched</span>
+              </div>
+              <p class="text-3xl font-bold">{{ stats?.total_watched_episodes || 0 }}</p>
             </div>
           </div>
         </section>
-
         <!-- Backup & Restore -->
         <section class="border border-gray-200 rounded-3xl p-6 bg-white shadow-sm">
           <div class="flex items-center gap-3 mb-4">
@@ -1913,7 +2059,6 @@ onMounted(async () => {
             {{ backupStatus.message }}
           </div>
         </section>
-
         <!-- Shows (completed) -->
 <section class="w-full">
   <button
@@ -2127,7 +2272,7 @@ onMounted(async () => {
         <span class="text-sm text-gray-500">{{ selectedList.item_count }} items</span>
       </div>
       <div class="px-6 py-4">
-        <div v-if="selectedListItems.length > 0" class="grid grid-cols-6 gap-3">
+        <div v-if="selectedListItems.length > 0" class="grid grid-cols-10 gap-3">
           <div
             v-for="item in selectedListItems"
             :key="item.media_id"
@@ -2287,7 +2432,6 @@ onMounted(async () => {
       </button>
       </div>
     </template>
-
     <!-- Import Backup Confirmation Modal -->
     <div v-if="showImportConfirm" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-lg p-6 max-w-sm w-full">
